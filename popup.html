@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ordinator</title>
+    <style>
+      :root {
+        --line: #d6deef;
+        --text: #12203b;
+        --muted: #60708f;
+        --accent: #1d4ed8;
+      }
+
+      body {
+        margin: 0;
+        width: 320px;
+        font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--text);
+        background: linear-gradient(165deg, #f7f9ff 0%, #eef3ff 100%);
+      }
+
+      .panel {
+        padding: 12px;
+        display: grid;
+        gap: 10px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 15px;
+      }
+
+      .meta {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .row {
+        display: grid;
+        gap: 6px;
+      }
+
+      select,
+      button {
+        font: inherit;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px 10px;
+      }
+
+      button {
+        cursor: pointer;
+        background: #fff;
+      }
+
+      button.primary {
+        border-color: transparent;
+        background: linear-gradient(180deg, #2563eb, #1d4ed8);
+        color: #fff;
+      }
+
+      .status {
+        min-height: 18px;
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <div>
+        <h1>Ordinator</h1>
+        <p id="meta" class="meta">Loading...</p>
+      </div>
+
+      <label class="row">
+        <span>Active workspace</span>
+        <select id="workspaceSelect"></select>
+      </label>
+
+      <button id="switchButton" class="primary" type="button">Switch Workspace</button>
+      <button id="sleepButton" type="button">Sleep Open Tabs</button>
+      <button id="openPanelButton" type="button">Open Dashboard</button>
+      <p id="status" class="status"></p>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ordinator</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>Ordinator</h1>
+          <button id="createWorkspaceButton" class="ghost-button" type="button">+ New</button>
+        </div>
+        <ul id="workspaceList" class="workspace-list"></ul>
+        <div class="rail-footer">
+          <button
+            id="settingsRailButton"
+            class="rail-icon-button"
+            type="button"
+            title="Global settings"
+            aria-label="Global settings"
+          >
+            &#9881;
+          </button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="main-header">
+          <div>
+            <h2 id="workspaceName">Workspace</h2>
+            <p id="workspaceMeta" class="meta-text"></p>
+          </div>
+          <div class="header-actions">
+            <button id="sleepButton" type="button">Sleep Open Tabs</button>
+            <button id="wakeButton" type="button">Wake Sleeping Tabs</button>
+          </div>
+        </header>
+
+        <nav class="tabs-nav">
+          <button class="tab-button active" data-view="tabs" type="button">Tabs</button>
+          <button class="tab-button" data-view="history" type="button">History</button>
+          <button class="tab-button" data-view="resources" type="button">Resources</button>
+        </nav>
+
+        <section id="content" class="content"></section>
+      </main>
+    </div>
+
+    <template id="itemTemplate">
+      <article class="list-item">
+        <div class="item-copy">
+          <p class="item-title"></p>
+          <p class="item-subtitle"></p>
+        </div>
+        <div class="item-actions"></div>
+      </article>
+    </template>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

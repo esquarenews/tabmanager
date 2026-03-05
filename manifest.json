@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Ordinator",
+  "description": "Workspace-based tab manager with sleep/wake, snapshots, resources, and memory cleanup.",
+  "version": "0.1.0",
+  "permissions": [
+    "alarms",
+    "storage",
+    "tabs"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Ordinator"
+  }
+}
