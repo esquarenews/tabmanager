@@ -10,6 +10,7 @@ const ui = {
   workspaceName: document.querySelector("#workspaceName"),
   workspaceMeta: document.querySelector("#workspaceMeta"),
   content: document.querySelector("#content"),
+  parkedWorkspaceList: document.querySelector("#parkedWorkspaceList"),
   createWorkspaceButton: document.querySelector("#createWorkspaceButton"),
   settingsRailButton: document.querySelector("#settingsRailButton"),
   sleepButton: document.querySelector("#sleepButton"),
@@ -22,6 +23,8 @@ const dragState = {
   type: null,
   payload: null
 };
+
+const EXPANDED_PARKED_WORKSPACES_MIN_WIDTH = 1700;
 
 function clearDropTargets() {
   for (const node of document.querySelectorAll(".drop-target")) {
@@ -456,6 +459,40 @@ function renderWorkspaceList() {
 
     li.appendChild(button);
     ui.workspaceList.appendChild(li);
+  }
+}
+
+function renderParkedWorkspaceList() {
+  ui.parkedWorkspaceList.textContent = "";
+  const parkedWorkspaces = Array.isArray(state.dashboard?.parkedWorkspaces) ? state.dashboard.parkedWorkspaces : [];
+  const visibleParked = parkedWorkspaces.filter((workspace) => workspace.id !== state.dashboard?.activeWorkspaceId);
+  if (visibleParked.length === 0) {
+    ui.parkedWorkspaceList.hidden = true;
+    return;
+  }
+
+  ui.parkedWorkspaceList.hidden = false;
+  const showExpanded = window.innerWidth >= EXPANDED_PARKED_WORKSPACES_MIN_WIDTH;
+
+  const heading = document.createElement("p");
+  heading.className = "parked-workspace-heading";
+  heading.textContent = "Hidden";
+  ui.parkedWorkspaceList.appendChild(heading);
+
+  if (!showExpanded) {
+    const compactBadge = document.createElement("div");
+    compactBadge.className = "parked-workspace-badge compact";
+    compactBadge.textContent = `${visibleParked.length} hidden`;
+    compactBadge.title = visibleParked.map((workspace) => workspace.name).join(", ");
+    ui.parkedWorkspaceList.appendChild(compactBadge);
+    return;
+  }
+
+  for (const workspace of visibleParked) {
+    const badge = document.createElement("div");
+    badge.className = "parked-workspace-badge";
+    badge.textContent = workspace.name;
+    ui.parkedWorkspaceList.appendChild(badge);
   }
 }
 
@@ -979,9 +1016,12 @@ function renderResourcesView(workspace) {
 }
 
 function renderSettingsView() {
-  const root = document.createElement("section");
-  root.className = "section";
-  root.innerHTML = `
+  const root = document.createElement("div");
+  root.className = "settings-stack";
+
+  const memorySection = document.createElement("section");
+  memorySection.className = "section";
+  memorySection.innerHTML = `
     <h3>Memory Settings</h3>
     <p class="section-note">Settings are stored in chrome.storage.local on this browser profile.</p>
   `;
@@ -1025,7 +1065,103 @@ function renderSettingsView() {
     );
   });
 
-  root.appendChild(form);
+  memorySection.appendChild(form);
+  root.appendChild(memorySection);
+
+  const managerSection = document.createElement("section");
+  managerSection.className = "section";
+  managerSection.innerHTML = `
+    <h3>Workspace Manager</h3>
+    <p class="section-note">Archive hides a workspace from the left rail and converts any open tabs in it into sleeping tabs. Archived workspaces can be restored later.</p>
+  `;
+
+  const activeWorkspaces = Array.isArray(state.dashboard.workspaces) ? state.dashboard.workspaces : [];
+  const archivedWorkspaces = Array.isArray(state.dashboard.archivedWorkspaces) ? state.dashboard.archivedWorkspaces : [];
+
+  const activeList = document.createElement("div");
+  activeList.className = "manager-list";
+  const activeHeading = document.createElement("p");
+  activeHeading.className = "manager-heading";
+  activeHeading.textContent = `Active Workspaces (${activeWorkspaces.length})`;
+  managerSection.appendChild(activeHeading);
+
+  if (activeWorkspaces.length === 0) {
+    activeList.appendChild(renderEmpty("No active workspaces."));
+  } else {
+    for (const managedWorkspace of activeWorkspaces) {
+      const summaryParts = [
+        `${managedWorkspace.sessionTabs.length} sleeping`,
+        `${managedWorkspace.resources.length} resources`
+      ];
+      if (managedWorkspace.id === state.dashboard.activeWorkspaceId) {
+        summaryParts.unshift("Currently selected");
+      }
+
+      const card = makeItemCard({
+        title: managedWorkspace.name,
+        subtitle: summaryParts.join(" • "),
+        actions: [
+          {
+            label: "Archive",
+            className: "danger",
+            onClick: () => {
+              const confirmed = window.confirm(`Archive workspace "${managedWorkspace.name}"?`);
+              if (!confirmed) {
+                return;
+              }
+              void runAction(
+                () =>
+                  send("ARCHIVE_WORKSPACE", {
+                    windowId: state.windowId,
+                    workspaceId: managedWorkspace.id
+                  }),
+                "Workspace archived."
+              );
+            }
+          }
+        ]
+      });
+      activeList.appendChild(card);
+    }
+  }
+
+  managerSection.appendChild(activeList);
+
+  const archivedHeading = document.createElement("p");
+  archivedHeading.className = "manager-heading";
+  archivedHeading.textContent = `Archived Workspaces (${archivedWorkspaces.length})`;
+  managerSection.appendChild(archivedHeading);
+
+  const archivedList = document.createElement("div");
+  archivedList.className = "manager-list";
+  if (archivedWorkspaces.length === 0) {
+    archivedList.appendChild(renderEmpty("No archived workspaces."));
+  } else {
+    for (const archivedWorkspace of archivedWorkspaces) {
+      const card = makeItemCard({
+        title: archivedWorkspace.name,
+        subtitle: `${archivedWorkspace.sessionTabs.length} sleeping • ${archivedWorkspace.resources.length} resources`,
+        actions: [
+          {
+            label: "Restore",
+            className: "primary",
+            onClick: () =>
+              runAction(
+                () =>
+                  send("RESTORE_WORKSPACE", {
+                    workspaceId: archivedWorkspace.id
+                  }),
+                "Workspace restored."
+              )
+          }
+        ]
+      });
+      archivedList.appendChild(card);
+    }
+  }
+
+  managerSection.appendChild(archivedList);
+  root.appendChild(managerSection);
   return root;
 }
 
@@ -1057,6 +1193,7 @@ function render() {
   }
 
   renderWorkspaceList();
+  renderParkedWorkspaceList();
   ui.workspaceName.textContent = workspace.name;
   ui.workspaceMeta.textContent = `${state.dashboard.openTabs.length} open • ${workspace.sessionTabs.length} sleeping • ${workspace.resources.length} resources`;
   applyWorkspaceIdentity(workspace);
@@ -1153,6 +1290,13 @@ function wireEvents() {
     if (changeInfo.status === "complete") {
       debounceRefresh();
     }
+  });
+
+  window.addEventListener("resize", () => {
+    if (!state.dashboard) {
+      return;
+    }
+    renderParkedWorkspaceList();
   });
 }
 
