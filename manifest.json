@@ -5,12 +5,32 @@
   "version": "0.1.0",
   "permissions": [
     "alarms",
+    "geolocation",
     "storage",
     "tabs"
   ],
+  "host_permissions": [
+    "https://api.open-meteo.com/*",
+    "https://api.unsplash.com/*",
+    "https://chatgpt.com/*"
+  ],
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "chatgpt-bridge.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_title": "Ordinator"
   }

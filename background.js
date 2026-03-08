@@ -20,7 +20,8 @@ const WORKSPACE_COLORS = Object.freeze([
 const DEFAULT_SETTINGS = Object.freeze({
   inactivityMinutes: 120,
   maxSnapshotsPerWorkspace: 20,
-  unfocusedSleepMinutes: 60
+  unfocusedSleepMinutes: 60,
+  unsplashAccessKey: "SQ54dvC8cGsSs51mFhu-bb807LDd8FWOP_fm4IqhcMs"
 });
 
 let stateCache = null;
@@ -279,6 +280,8 @@ function normalizeState(state) {
     10,
     Number(settings.unfocusedSleepMinutes) || DEFAULT_SETTINGS.unfocusedSleepMinutes
   );
+  settings.unsplashAccessKey =
+    typeof settings.unsplashAccessKey === "string" ? settings.unsplashAccessKey.trim() : DEFAULT_SETTINGS.unsplashAccessKey;
 
   const tabWorkspaceById = {};
   if (state.tabWorkspaceById && typeof state.tabWorkspaceById === "object") {
@@ -1588,6 +1591,13 @@ async function handleMessage(message) {
       return getDashboardData(requestedWindowId);
     }
 
+    case "GET_SETTINGS": {
+      return queueOperation(async () => {
+        const state = await loadState();
+        return { settings: state.settings };
+      });
+    }
+
     case "CREATE_WORKSPACE": {
       return mutateState(async (state) => {
         const workspaceName = normalizeText(payload.name, `Workspace ${state.workspaceOrder.length + 1}`);
@@ -1893,6 +1903,10 @@ async function handleMessage(message) {
           10,
           Number(nextSettings.unfocusedSleepMinutes) || state.settings.unfocusedSleepMinutes
         );
+        nextSettings.unsplashAccessKey =
+          typeof incomingSettings.unsplashAccessKey === "string"
+            ? incomingSettings.unsplashAccessKey.trim()
+            : state.settings.unsplashAccessKey;
 
         state.settings = nextSettings;
         return { settings: state.settings };

@@ -1041,6 +1041,10 @@ function renderSettingsView() {
       <span>Snapshots retained per workspace</span>
       <input name="maxSnapshotsPerWorkspace" type="number" min="5" step="1" value="${state.dashboard.settings.maxSnapshotsPerWorkspace}" required />
     </label>
+    <label class="settings-row">
+      <span>Unsplash Access Key for new tab backgrounds</span>
+      <input name="unsplashAccessKey" type="text" placeholder="Optional" value="${state.dashboard.settings.unsplashAccessKey || ""}" />
+    </label>
     <button class="primary" type="submit">Save Settings</button>
   `;
 
@@ -1050,6 +1054,7 @@ function renderSettingsView() {
     const inactivityMinutes = Number(formData.get("inactivityMinutes"));
     const unfocusedSleepMinutes = Number(formData.get("unfocusedSleepMinutes"));
     const maxSnapshotsPerWorkspace = Number(formData.get("maxSnapshotsPerWorkspace"));
+    const unsplashAccessKey = String(formData.get("unsplashAccessKey") || "").trim();
 
     void runAction(
       () =>
@@ -1058,7 +1063,8 @@ function renderSettingsView() {
           settings: {
             inactivityMinutes,
             unfocusedSleepMinutes,
-            maxSnapshotsPerWorkspace
+            maxSnapshotsPerWorkspace,
+            unsplashAccessKey
           }
         }),
       "Settings saved."

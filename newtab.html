@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ordinator</title>
+    <script src="newtab-bootstrap.js"></script>
+    <link rel="stylesheet" href="newtab.css" />
+  </head>
+  <body>
+    <div class="newtab-shell">
+      <div class="backdrop" aria-hidden="true"></div>
+      <main class="hero">
+        <p class="eyebrow">Ordinator</p>
+        <h1>Start somewhere useful</h1>
+
+        <div class="search-grid">
+          <form id="googleForm" class="search-panel search-google" action="https://www.google.com/search" method="get">
+            <label class="panel-label" for="googleQuery">Google search</label>
+            <div class="panel-input-row">
+              <input id="googleQuery" name="q" type="search" autocomplete="off" placeholder="Search the web" />
+              <button type="submit">Search</button>
+            </div>
+          </form>
+
+          <form id="chatgptForm" class="search-panel search-chatgpt">
+            <label class="panel-label" for="chatgptQuery">ChatGPT</label>
+            <div class="panel-input-row">
+              <input id="chatgptQuery" type="search" autocomplete="off" placeholder="Ask ChatGPT" />
+              <button type="submit">Ask</button>
+            </div>
+          </form>
+        </div>
+      </main>
+
+      <footer class="meta-bar">
+        <p id="photoCredit" class="photo-credit"></p>
+        <div class="status-block">
+          <p id="timeValue" class="time-value">--:--</p>
+          <p id="dateValue" class="date-value">--/--/----</p>
+          <p id="weatherValue" class="weather-value">Weather unavailable</p>
+        </div>
+      </footer>
+    </div>
+
+    <script type="module" src="newtab.js"></script>
+  </body>
+</html>
