@@ -156,6 +156,7 @@ function createWorkspace(name, preferredColor = null) {
     id,
     name: normalizeText(name, "Workspace"),
     color: normalizeWorkspaceColor(preferredColor, id),
+    parkedTabs: [],
     sessionTabs: [],
     resources: [],
     history: [],
@@ -189,6 +190,7 @@ function normalizeWorkspace(id, workspace) {
     id,
     name: normalizeText(workspace.name, "Workspace"),
     color: normalizeWorkspaceColor(workspace.color, id),
+    parkedTabs: dedupeTabRecords(Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs : []),
     sessionTabs: dedupeTabRecords(Array.isArray(workspace.sessionTabs) ? workspace.sessionTabs : []),
     resources: normalizeResources(Array.isArray(workspace.resources) ? workspace.resources : []),
     history: normalizeHistory(Array.isArray(workspace.history) ? workspace.history : []),
@@ -788,11 +790,13 @@ async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId) {
     return { parkedCount: 0 };
   }
 
+  const workspace = state.workspaces[workspaceId];
   const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
     assignUnknownToWorkspaceId: workspaceId
   });
   if (tabs.length === 0) {
-    clearDeferredSleep(state, windowId, workspaceId);
+    workspace.parkedTabs = [];
+    clearDeferredSleepForWorkspace(state, workspaceId);
     await cleanupParkedWindow(state, workspaceId);
     return { parkedCount: 0 };
   }
@@ -800,6 +804,7 @@ async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId) {
   const parkedWindowId = await ensureParkedWindow(state, workspaceId);
   const orderedTabs = [...tabs].sort((a, b) => a.index - b.index);
   const movedTabIds = [];
+  const movedRecords = [];
 
   for (const tab of orderedTabs) {
     if (!Number.isFinite(tab.id)) {
@@ -808,13 +813,14 @@ async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId) {
     try {
       await chrome.tabs.move(tab.id, { windowId: parkedWindowId, index: -1 });
       movedTabIds.push(tab.id);
+      movedRecords.push(tabToRecord(tab));
     } catch (error) {
       console.warn("Failed to park workspace tab:", tab.id, error);
     }
   }
 
-  clearDeferredSleep(state, windowId, workspaceId);
-  scheduleDeferredSleep(state, parkedWindowId, workspaceId, movedTabIds);
+  workspace.parkedTabs = dedupeTabRecords(movedRecords);
+  clearDeferredSleepForWorkspace(state, workspaceId);
   await cleanupParkedWindow(state, workspaceId);
   return { parkedCount: movedTabIds.length, parkedWindowId };
 }
@@ -824,9 +830,21 @@ async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) 
     return { restoredCount: 0 };
   }
 
+  const workspace = state.workspaces[workspaceId];
   const parkedWindowId = await getValidParkedWindowId(state, workspaceId);
   if (!Number.isFinite(parkedWindowId) || parkedWindowId === windowId) {
-    clearDeferredSleep(state, windowId, workspaceId);
+    clearDeferredSleepForWorkspace(state, workspaceId);
+    if (Array.isArray(workspace.parkedTabs) && workspace.parkedTabs.length > 0) {
+      const openResult = await openTabRecords(windowId, workspace.parkedTabs, {
+        openFallback: false,
+        activateFirst: false
+      });
+      setTabAssignments(state, openResult.tabIds, workspaceId);
+      if (openResult.openedCount > 0) {
+        workspace.parkedTabs = [];
+      }
+      return { restoredCount: openResult.openedCount };
+    }
     return { restoredCount: 0 };
   }
 
@@ -842,22 +860,38 @@ async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) 
     .sort((a, b) => a.index - b.index);
 
   if (workspaceTabs.length === 0) {
-    clearDeferredSleep(state, parkedWindowId, workspaceId);
+    clearDeferredSleepForWorkspace(state, workspaceId);
     await cleanupParkedWindow(state, workspaceId);
+    if (Array.isArray(workspace.parkedTabs) && workspace.parkedTabs.length > 0) {
+      const openResult = await openTabRecords(windowId, workspace.parkedTabs, {
+        openFallback: false,
+        activateFirst: false
+      });
+      setTabAssignments(state, openResult.tabIds, workspaceId);
+      if (openResult.openedCount > 0) {
+        workspace.parkedTabs = [];
+      }
+      return { restoredCount: openResult.openedCount };
+    }
     return { restoredCount: 0 };
   }
 
+  const remainingRecords = [];
+  let restoredCount = 0;
   for (const tab of workspaceTabs) {
     try {
       await chrome.tabs.move(tab.id, { windowId, index: -1 });
+      restoredCount += 1;
     } catch (error) {
       console.warn("Failed to restore parked tab:", tab.id, error);
+      remainingRecords.push(tabToRecord(tab));
     }
   }
 
-  clearDeferredSleep(state, parkedWindowId, workspaceId);
+  workspace.parkedTabs = dedupeTabRecords(remainingRecords);
+  clearDeferredSleepForWorkspace(state, workspaceId);
   await cleanupParkedWindow(state, workspaceId);
-  return { restoredCount: workspaceTabs.length };
+  return { restoredCount };
 }
 
 async function syncWindowWorkspaceVisibility(state, windowId, activeWorkspaceId) {
@@ -1221,6 +1255,7 @@ async function sleepWorkspaceTabsAcrossWindows(state, workspaceId, reason) {
     pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
     workspace.updatedAt = now();
   }
+  workspace.parkedTabs = [];
 
   const tabIdsByWindow = new Map();
   for (const tab of matchingTabs) {
@@ -1473,6 +1508,10 @@ async function runMemorySweep() {
       }
 
       const windowId = browserWindow.id;
+      if (findWorkspaceIdByParkedWindow(state, windowId)) {
+        delete state.deferredSleepByWindow[windowKey(windowId)];
+        continue;
+      }
       const activeWorkspaceId = state.activeWorkspaceByWindow[windowKey(windowId)];
       const manageableTabs = browserWindow.tabs.filter(
         (tab) => tab && typeof tab.id === "number" && !tab.pinned && isOpenableUrl(tab.url)
@@ -1991,6 +2030,7 @@ chrome.windows.onRemoved.addListener((windowId) => {
 
     const working = structuredClone(state);
     delete working.parkedWindowByWorkspace[workspaceId];
+    delete working.activeWorkspaceByWindow[windowKey(windowId)];
     delete working.deferredSleepByWindow[windowKey(windowId)];
     await saveState(working);
     await notifyStateUpdated();
