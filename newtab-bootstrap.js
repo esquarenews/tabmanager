@@ -8,7 +8,13 @@
     }
 
     const background = JSON.parse(raw);
-    if (!background || typeof background.imageUrl !== "string" || background.imageUrl.length === 0) {
+    if (
+      !background ||
+      typeof background.imageUrl !== "string" ||
+      background.imageUrl.length === 0 ||
+      !Number.isFinite(background.expiresAt) ||
+      background.expiresAt <= Date.now()
+    ) {
       return;
     }
 

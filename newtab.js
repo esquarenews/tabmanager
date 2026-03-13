@@ -142,7 +142,8 @@ function buildUnsplashImageUrl(photo) {
   return typeof photo?.urls?.regular === "string" ? photo.urls.regular : "";
 }
 
-function applyBackground(background) {
+function applyBackground(background, options = {}) {
+  const { expiresAt = null, persistBootstrap = true } = options;
   if (!background || typeof background.imageUrl !== "string" || background.imageUrl.length === 0) {
     try {
       window.localStorage.removeItem(LAST_BACKGROUND_KEY);
@@ -155,12 +156,17 @@ function applyBackground(background) {
 
   document.documentElement.style.setProperty("--backdrop-image", `url("${background.imageUrl}")`);
   try {
-    window.localStorage.setItem(
-      LAST_BACKGROUND_KEY,
-      JSON.stringify({
-        imageUrl: background.imageUrl
-      })
-    );
+    if (persistBootstrap) {
+      window.localStorage.setItem(
+        LAST_BACKGROUND_KEY,
+        JSON.stringify({
+          imageUrl: background.imageUrl,
+          expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + BACKGROUND_CACHE_MS
+        })
+      );
+    } else {
+      window.localStorage.removeItem(LAST_BACKGROUND_KEY);
+    }
   } catch (error) {
     // Ignore local bootstrap cache errors.
   }
@@ -249,10 +255,15 @@ async function loadBackground() {
   const cached = await getLocalCache(BACKGROUND_CACHE_KEY);
   const cachedBatch = normalizeBackgroundBatch(cached);
   const cachedSelection = getBackgroundForDisplay(cachedBatch);
-  if (cachedSelection?.background) {
-    applyBackground(cachedSelection.background);
+  const hasFreshCachedBatch = !!(
+    cachedBatch &&
+    Number.isFinite(cachedBatch.expiresAt) &&
+    cachedBatch.expiresAt > Date.now()
+  );
+  if (cachedSelection?.background && hasFreshCachedBatch) {
+    applyBackground(cachedSelection.background, { expiresAt: cachedBatch.expiresAt });
     await setLocalCache(BACKGROUND_CACHE_KEY, cachedSelection.nextCache);
-  } else {
+  } else if (!cachedSelection?.background) {
     applyBackground(null);
   }
 
@@ -262,7 +273,13 @@ async function loadBackground() {
     cachedBatch.images.length < BACKGROUND_BATCH_SIZE ||
     !Number.isFinite(cachedBatch.expiresAt) ||
     cachedBatch.expiresAt <= Date.now();
-  if (!accessKey || !shouldRefresh) {
+  if (!accessKey) {
+    if (cachedSelection?.background && !hasFreshCachedBatch) {
+      applyBackground(cachedSelection.background, { persistBootstrap: false });
+    }
+    return;
+  }
+  if (!shouldRefresh) {
     return;
   }
 
@@ -273,9 +290,11 @@ async function loadBackground() {
       return;
     }
     await setLocalCache(BACKGROUND_CACHE_KEY, freshSelection.nextCache);
-    applyBackground(freshSelection.background);
+    applyBackground(freshSelection.background, { expiresAt: freshBatch.expiresAt });
   } catch (error) {
-    if (!cachedSelection?.background) {
+    if (cachedSelection?.background) {
+      applyBackground(cachedSelection.background, { persistBootstrap: false });
+    } else {
       applyBackground(null);
     }
   }
