@@ -6,8 +6,17 @@ const BACKGROUND_CACHE_MS = 4 * 60 * 60 * 1000;
 const BACKGROUND_BATCH_SIZE = 4;
 const WEATHER_CACHE_MS = 15 * 60 * 1000;
 const CHATGPT_PROMPT_PARAM = "ordinator_prompt";
+const HERO_TITLES = Object.freeze([
+  "Start somewhere useful",
+  "Start somewhere helpful",
+  "Start somewhere educational",
+  "Start somewhere",
+  "Start somewhere productive",
+  "Start somewhere fun"
+]);
 
 const ui = {
+  heroTitle: document.querySelector("#heroTitle"),
   googleForm: document.querySelector("#googleForm"),
   googleQuery: document.querySelector("#googleQuery"),
   chatgptForm: document.querySelector("#chatgptForm"),
@@ -24,6 +33,11 @@ async function send(action, payload = {}) {
     throw new Error(response?.error || "Request failed.");
   }
   return response.result;
+}
+
+function chooseHeroTitle() {
+  const index = Math.floor(Math.random() * HERO_TITLES.length);
+  return HERO_TITLES[index] || HERO_TITLES[0];
 }
 
 function formatClockParts(date) {
@@ -75,13 +89,15 @@ function normalizeBackgroundBatch(cache) {
     if (images.length === 0) {
       return null;
     }
+    const batchFetchedAt = Number.isFinite(cache.batchFetchedAt) ? cache.batchFetchedAt : Date.now();
+    const maxExpiresAt = batchFetchedAt + BACKGROUND_CACHE_MS;
     return {
       images,
-      batchFetchedAt: Number.isFinite(cache.batchFetchedAt) ? cache.batchFetchedAt : Date.now(),
+      batchFetchedAt,
       nextIndex: Number.isFinite(cache.nextIndex) ? Math.max(0, cache.nextIndex) : 0,
       expiresAt: Number.isFinite(cache.expiresAt)
-        ? cache.expiresAt
-        : (Number.isFinite(cache.batchFetchedAt) ? cache.batchFetchedAt : Date.now()) + images.length * BACKGROUND_CACHE_MS
+        ? Math.min(cache.expiresAt, maxExpiresAt)
+        : maxExpiresAt
     };
   }
 
@@ -224,7 +240,7 @@ async function fetchFeaturedUnsplashBackgroundBatch(accessKey) {
     })),
     batchFetchedAt,
     nextIndex: 0,
-    expiresAt: batchFetchedAt + uniquePhotos.length * BACKGROUND_CACHE_MS
+    expiresAt: batchFetchedAt + BACKGROUND_CACHE_MS
   };
 }
 
@@ -328,6 +344,7 @@ function wireForms() {
 }
 
 async function init() {
+  ui.heroTitle.textContent = chooseHeroTitle();
   updateClock();
   window.setInterval(updateClock, 1000);
   wireForms();

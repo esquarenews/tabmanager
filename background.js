@@ -834,17 +834,7 @@ async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) 
   const parkedWindowId = await getValidParkedWindowId(state, workspaceId);
   if (!Number.isFinite(parkedWindowId) || parkedWindowId === windowId) {
     clearDeferredSleepForWorkspace(state, workspaceId);
-    if (Array.isArray(workspace.parkedTabs) && workspace.parkedTabs.length > 0) {
-      const openResult = await openTabRecords(windowId, workspace.parkedTabs, {
-        openFallback: false,
-        activateFirst: false
-      });
-      setTabAssignments(state, openResult.tabIds, workspaceId);
-      if (openResult.openedCount > 0) {
-        workspace.parkedTabs = [];
-      }
-      return { restoredCount: openResult.openedCount };
-    }
+    moveParkedTabsToSleeping(state, workspace, "parked-window-closed");
     return { restoredCount: 0 };
   }
 
@@ -862,17 +852,7 @@ async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) 
   if (workspaceTabs.length === 0) {
     clearDeferredSleepForWorkspace(state, workspaceId);
     await cleanupParkedWindow(state, workspaceId);
-    if (Array.isArray(workspace.parkedTabs) && workspace.parkedTabs.length > 0) {
-      const openResult = await openTabRecords(windowId, workspace.parkedTabs, {
-        openFallback: false,
-        activateFirst: false
-      });
-      setTabAssignments(state, openResult.tabIds, workspaceId);
-      if (openResult.openedCount > 0) {
-        workspace.parkedTabs = [];
-      }
-      return { restoredCount: openResult.openedCount };
-    }
+    moveParkedTabsToSleeping(state, workspace, "parked-window-closed");
     return { restoredCount: 0 };
   }
 
@@ -1036,6 +1016,20 @@ function pushSnapshot(workspace, records, reason, maxSnapshots) {
     tabs
   });
   workspace.history = workspace.history.slice(0, maxSnapshots);
+}
+
+function moveParkedTabsToSleeping(state, workspace, reason) {
+  const parkedRecords = dedupeTabRecords(Array.isArray(workspace?.parkedTabs) ? workspace.parkedTabs : []);
+  if (parkedRecords.length === 0) {
+    workspace.parkedTabs = [];
+    return 0;
+  }
+
+  appendSleepingTabs(workspace, parkedRecords);
+  pushSnapshot(workspace, parkedRecords, reason, state.settings.maxSnapshotsPerWorkspace);
+  workspace.parkedTabs = [];
+  workspace.updatedAt = now();
+  return parkedRecords.length;
 }
 
 async function openTabRecords(windowId, records, options = {}) {
@@ -2029,6 +2023,10 @@ chrome.windows.onRemoved.addListener((windowId) => {
     }
 
     const working = structuredClone(state);
+    const workspace = working.workspaces[workspaceId];
+    if (workspace) {
+      moveParkedTabsToSleeping(working, workspace, "parked-window-closed");
+    }
     delete working.parkedWindowByWorkspace[workspaceId];
     delete working.activeWorkspaceByWindow[windowKey(windowId)];
     delete working.deferredSleepByWindow[windowKey(windowId)];
