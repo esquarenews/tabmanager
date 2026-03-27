@@ -142,34 +142,67 @@ function buildUnsplashImageUrl(photo) {
   return typeof photo?.urls?.regular === "string" ? photo.urls.regular : "";
 }
 
-function applyBackground(background, options = {}) {
-  const { expiresAt = null, persistBootstrap = true } = options;
+function clearBootstrapBackground() {
+  try {
+    window.localStorage.removeItem(LAST_BACKGROUND_KEY);
+  } catch (error) {
+    // Ignore local bootstrap cache errors.
+  }
+}
+
+function setBootstrapBackground(background, expiresAt) {
   if (!background || typeof background.imageUrl !== "string" || background.imageUrl.length === 0) {
-    try {
-      window.localStorage.removeItem(LAST_BACKGROUND_KEY);
-    } catch (error) {
-      // Ignore local bootstrap cache errors.
+    clearBootstrapBackground();
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      LAST_BACKGROUND_KEY,
+      JSON.stringify({
+        imageUrl: background.imageUrl,
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + BACKGROUND_CACHE_MS
+      })
+    );
+  } catch (error) {
+    // Ignore local bootstrap cache errors.
+  }
+}
+
+function syncBootstrapBackgroundFromCache(cache) {
+  const nextSelection = getBackgroundForDisplay(cache);
+  if (!nextSelection?.background) {
+    clearBootstrapBackground();
+    return;
+  }
+  setBootstrapBackground(nextSelection.background, cache?.expiresAt);
+}
+
+function preloadBackgroundBatch(cache) {
+  const normalized = normalizeBackgroundBatch(cache);
+  if (!normalized) {
+    return;
+  }
+
+  for (const image of normalized.images) {
+    if (!image || typeof image.imageUrl !== "string" || image.imageUrl.length === 0) {
+      continue;
     }
+    const preload = new Image();
+    preload.decoding = "async";
+    preload.loading = "eager";
+    preload.src = image.imageUrl;
+  }
+}
+
+function applyBackground(background) {
+  if (!background || typeof background.imageUrl !== "string" || background.imageUrl.length === 0) {
+    clearBootstrapBackground();
     ui.photoCredit.textContent = "Add an Unsplash Access Key in Ordinator settings to enable featured backgrounds.";
     return;
   }
 
   document.documentElement.style.setProperty("--backdrop-image", `url("${background.imageUrl}")`);
-  try {
-    if (persistBootstrap) {
-      window.localStorage.setItem(
-        LAST_BACKGROUND_KEY,
-        JSON.stringify({
-          imageUrl: background.imageUrl,
-          expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + BACKGROUND_CACHE_MS
-        })
-      );
-    } else {
-      window.localStorage.removeItem(LAST_BACKGROUND_KEY);
-    }
-  } catch (error) {
-    // Ignore local bootstrap cache errors.
-  }
   if (background.photographer && background.photoPageUrl) {
     ui.photoCredit.textContent = "";
     ui.photoCredit.append("Photo by ");
@@ -261,8 +294,10 @@ async function loadBackground() {
     cachedBatch.expiresAt > Date.now()
   );
   if (cachedSelection?.background && hasFreshCachedBatch) {
-    applyBackground(cachedSelection.background, { expiresAt: cachedBatch.expiresAt });
+    applyBackground(cachedSelection.background);
     await setLocalCache(BACKGROUND_CACHE_KEY, cachedSelection.nextCache);
+    syncBootstrapBackgroundFromCache(cachedSelection.nextCache);
+    preloadBackgroundBatch(cachedSelection.nextCache);
   } else if (!cachedSelection?.background) {
     applyBackground(null);
   }
@@ -274,9 +309,7 @@ async function loadBackground() {
     !Number.isFinite(cachedBatch.expiresAt) ||
     cachedBatch.expiresAt <= Date.now();
   if (!accessKey) {
-    if (cachedSelection?.background && !hasFreshCachedBatch) {
-      applyBackground(cachedSelection.background, { persistBootstrap: false });
-    }
+    clearBootstrapBackground();
     return;
   }
   if (!shouldRefresh) {
@@ -290,10 +323,13 @@ async function loadBackground() {
       return;
     }
     await setLocalCache(BACKGROUND_CACHE_KEY, freshSelection.nextCache);
-    applyBackground(freshSelection.background, { expiresAt: freshBatch.expiresAt });
+    syncBootstrapBackgroundFromCache(freshSelection.nextCache);
+    preloadBackgroundBatch(freshSelection.nextCache);
+    applyBackground(freshSelection.background);
   } catch (error) {
     if (cachedSelection?.background) {
-      applyBackground(cachedSelection.background, { persistBootstrap: false });
+      clearBootstrapBackground();
+      applyBackground(cachedSelection.background);
     } else {
       applyBackground(null);
     }
