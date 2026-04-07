@@ -384,6 +384,8 @@ button.danger {
   gap: 10px;
   align-items: start;
   background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%);
+  min-width: 0;
+  overflow: hidden;
 }
 
 .list-item.draggable-item {
@@ -401,7 +403,9 @@ button.danger {
 }
 
 .item-copy {
+  flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
 }
 
 .item-copy.clickable {
@@ -442,15 +446,125 @@ button.danger {
 }
 
 .item-actions {
+  flex: 0 0 auto;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   justify-content: end;
+  max-width: min(42%, 320px);
 }
 
 .item-actions button {
   padding: 5px 8px;
   font-size: 12px;
+}
+
+.history-snapshot-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px;
+  background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.history-snapshot-summary {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.history-snapshot-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  grid-template-areas:
+    "toggle title"
+    "toggle subtitle";
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 2px;
+}
+
+.history-toggle-button {
+  grid-area: toggle;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.history-toggle-button:hover {
+  color: var(--accent);
+  border-color: #93c5fd;
+}
+
+.history-snapshot-copy .item-title {
+  grid-area: title;
+}
+
+.history-snapshot-copy .item-subtitle {
+  grid-area: subtitle;
+}
+
+.snapshot-detail-list {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.snapshot-detail-list[hidden] {
+  display: none;
+}
+
+.snapshot-detail-row {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+  padding-left: 18px;
+  min-width: 0;
+}
+
+.snapshot-detail-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.snapshot-detail-title,
+.snapshot-detail-subtitle {
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.snapshot-detail-title {
+  font-size: 12px;
+}
+
+.snapshot-detail-subtitle {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.snapshot-detail-row button {
+  flex: 0 0 auto;
 }
 
 .icon-action-button {

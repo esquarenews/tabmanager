@@ -2,7 +2,8 @@ const state = {
   windowId: null,
   dashboard: null,
   activeView: "tabs",
-  refreshTimer: null
+  refreshTimer: null,
+  expandedHistorySnapshots: new Set()
 };
 
 const ui = {
@@ -152,6 +153,30 @@ function formatDisplayUrl(url, options = {}) {
     return truncateDisplayText(`${parsed.origin}${path}${query}`, maxLength);
   } catch (error) {
     return truncateDisplayText(url, maxLength);
+  }
+}
+
+function formatSnapshotReason(reason) {
+  const normalized = String(reason || "").trim().toLowerCase();
+  switch (normalized) {
+    case "restore":
+      return "Restored Workspace";
+    case "partial-restore":
+      return "Partial Restore";
+    case "memory":
+      return "Auto-Saved";
+    case "archive":
+      return "Archived Workspace";
+    case "manual":
+      return "Manual Sleep";
+    case "unfocused-timeout":
+      return "Background Sleep";
+    default:
+      return normalized
+        .split(/[\s_-]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ") || "Snapshot";
   }
 }
 
@@ -503,7 +528,9 @@ function makeItemCard({ title, subtitle, actions }) {
   const actionsEl = node.querySelector(".item-actions");
 
   titleEl.textContent = title;
+  titleEl.title = title;
   subtitleEl.textContent = subtitle;
+  subtitleEl.title = subtitle;
 
   for (const action of actions) {
     const button = document.createElement("button");
@@ -897,26 +924,107 @@ function renderHistoryView(workspace) {
   }
 
   for (const snapshot of workspace.history) {
-    const card = makeItemCard({
-      title: `${snapshot.tabs.length} tabs • ${snapshot.reason}`,
-      subtitle: formatDate(snapshot.createdAt),
-      actions: [
-        {
-          label: "Restore",
-          className: "primary",
-          onClick: () =>
-            runAction(
-              () =>
-                send("RESTORE_SNAPSHOT", {
-                  windowId: state.windowId,
-                  workspaceId: workspace.id,
-                  snapshotId: snapshot.id
-                }),
-              "Snapshot restored."
-            )
-        }
-      ]
+    const card = document.createElement("article");
+    card.className = "history-snapshot-card";
+
+    const summaryRow = document.createElement("div");
+    summaryRow.className = "history-snapshot-summary";
+
+    const summaryCopy = document.createElement("div");
+    summaryCopy.className = "history-snapshot-copy";
+
+    const title = document.createElement("p");
+    title.className = "item-title";
+    title.textContent = `${snapshot.tabs.length} tabs • ${formatSnapshotReason(snapshot.reason)}`;
+    title.title = title.textContent;
+
+    const subtitle = document.createElement("p");
+    subtitle.className = "item-subtitle";
+    subtitle.textContent = formatDate(snapshot.createdAt);
+    subtitle.title = subtitle.textContent;
+
+    const toggleButton = document.createElement("button");
+    toggleButton.type = "button";
+    toggleButton.className = "history-toggle-button";
+    toggleButton.title = state.expandedHistorySnapshots.has(snapshot.id) ? "Hide tabs in snapshot" : "Show tabs in snapshot";
+    toggleButton.setAttribute("aria-expanded", state.expandedHistorySnapshots.has(snapshot.id) ? "true" : "false");
+    toggleButton.textContent = state.expandedHistorySnapshots.has(snapshot.id) ? "▾" : "▸";
+    summaryCopy.append(toggleButton, title, subtitle);
+
+    const restoreButton = document.createElement("button");
+    restoreButton.type = "button";
+    restoreButton.className = "primary";
+    restoreButton.textContent = "Restore";
+    restoreButton.addEventListener("click", () => {
+      void runAction(
+        () =>
+          send("RESTORE_SNAPSHOT", {
+            windowId: state.windowId,
+            workspaceId: workspace.id,
+            snapshotId: snapshot.id
+          }),
+        "Snapshot restored."
+      );
     });
+
+    summaryRow.append(summaryCopy, restoreButton);
+    card.appendChild(summaryRow);
+
+    const details = document.createElement("div");
+    details.className = "snapshot-detail-list";
+    details.hidden = !state.expandedHistorySnapshots.has(snapshot.id);
+
+    for (const tab of snapshot.tabs) {
+      const row = document.createElement("div");
+      row.className = "snapshot-detail-row";
+
+      const copy = document.createElement("div");
+      copy.className = "snapshot-detail-copy";
+
+      const title = document.createElement("p");
+      title.className = "snapshot-detail-title";
+      title.textContent = tab.title;
+      title.title = tab.title;
+
+      const subtitle = document.createElement("p");
+      subtitle.className = "snapshot-detail-subtitle";
+      const formattedUrl = formatDisplayUrl(tab.url, { maxLength: 68 });
+      subtitle.textContent = formattedUrl;
+      subtitle.title = tab.url;
+
+      copy.append(title, subtitle);
+
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "primary";
+      openButton.textContent = "Open";
+      openButton.addEventListener("click", () => {
+        void runAction(
+          () =>
+            send("OPEN_SNAPSHOT_TAB", {
+              windowId: state.windowId,
+              workspaceId: workspace.id,
+              snapshotId: snapshot.id,
+              url: tab.url
+            }),
+          "Snapshot tab opened."
+        );
+      });
+
+      row.append(copy, openButton);
+      details.appendChild(row);
+    }
+
+    toggleButton.addEventListener("click", () => {
+      if (state.expandedHistorySnapshots.has(snapshot.id)) {
+        state.expandedHistorySnapshots.delete(snapshot.id);
+      } else {
+        state.expandedHistorySnapshots.add(snapshot.id);
+      }
+      render();
+    });
+
+    card.appendChild(details);
     root.appendChild(card);
   }
 
@@ -975,7 +1083,7 @@ function renderResourcesView(workspace) {
     for (const resource of workspace.resources) {
       const card = makeItemCard({
         title: resource.title,
-        subtitle: resource.url,
+        subtitle: formatDisplayUrl(resource.url, { maxLength: 72 }),
         actions: [
           {
             label: "Open",
@@ -1023,7 +1131,7 @@ function renderSettingsView() {
   memorySection.className = "section";
   memorySection.innerHTML = `
     <h3>Memory Settings</h3>
-    <p class="section-note">Settings are stored in chrome.storage.local on this browser profile.</p>
+    <p class="section-note">Tabs now stay live in hidden workspace windows until you manually sleep them. Settings are stored in chrome.storage.local on this browser profile.</p>
   `;
 
   const form = document.createElement("form");
