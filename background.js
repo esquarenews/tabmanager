@@ -692,6 +692,28 @@ function scheduleSyncExport(delay = SYNC_EXPORT_DEBOUNCE_MS) {
   }, delay);
 }
 
+async function syncNow() {
+  return queueOperation(async () => {
+    if (syncExportTimer) {
+      clearTimeout(syncExportTimer);
+      syncExportTimer = null;
+    }
+
+    const localState = stateCache ? structuredClone(stateCache) : await loadState();
+    const syncSnapshot = await loadSyncSnapshot();
+    const merged = mergeSyncSnapshotIntoState(localState, syncSnapshot);
+    const savedState = await saveState(merged.state);
+    await exportSyncSnapshot();
+    await notifyStateUpdated();
+
+    return {
+      synced: true,
+      workspaceCount: savedState.workspaceOrder.length,
+      syncedWorkspaceCount: Object.keys(savedState.syncedOpenTabsByWorkspace || {}).length
+    };
+  });
+}
+
 function queueOperation(task) {
   const run = operationQueue.then(task);
   operationQueue = run.catch(() => {});
@@ -2268,6 +2290,10 @@ async function handleMessage(message) {
         state.settings = nextSettings;
         return { settings: state.settings };
       });
+    }
+
+    case "SYNC_NOW": {
+      return syncNow();
     }
 
     case "OPEN_DASHBOARD": {

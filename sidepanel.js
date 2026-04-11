@@ -14,6 +14,7 @@ const ui = {
   content: document.querySelector("#content"),
   parkedWorkspaceList: document.querySelector("#parkedWorkspaceList"),
   createWorkspaceButton: document.querySelector("#createWorkspaceButton"),
+  syncNowButton: document.querySelector("#syncNowButton"),
   settingsRailButton: document.querySelector("#settingsRailButton"),
   sleepButton: document.querySelector("#sleepButton"),
   wakeButton: document.querySelector("#wakeButton"),
@@ -1408,7 +1409,9 @@ function render() {
   for (const button of ui.tabButtons) {
     button.classList.toggle("active", button.dataset.view === state.activeView);
   }
-  ui.settingsRailButton.classList.toggle("active", state.activeView === "settings");
+  if (ui.settingsRailButton) {
+    ui.settingsRailButton.classList.toggle("active", state.activeView === "settings");
+  }
 
   renderMainContent();
 }
@@ -1479,10 +1482,24 @@ function wireEvents() {
     });
   }
 
-  ui.settingsRailButton.addEventListener("click", () => {
-    state.activeView = "settings";
-    render();
-  });
+  if (ui.settingsRailButton) {
+    ui.settingsRailButton.addEventListener("click", () => {
+      state.activeView = "settings";
+      render();
+    });
+  }
+
+  if (ui.syncNowButton) {
+    ui.syncNowButton.addEventListener("click", () => {
+      void runAction(
+        () =>
+          send("SYNC_NOW", {
+            windowId: state.windowId
+          }),
+        "Sync complete."
+      );
+    });
+  }
 
   if (ui.workspaceNameButton) {
     ui.workspaceNameButton.addEventListener("click", () => {
