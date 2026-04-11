@@ -1982,11 +1982,10 @@ async function getDashboardData(windowId) {
     const ensured = ensureWorkspaceForWindow(working, windowId);
     const activeWorkspaceId = ensured.workspaceId;
     const visibilityResult = await syncWindowWorkspaceVisibility(working, windowId, activeWorkspaceId);
-    const restoreResult = await restoreParkedWorkspaceTabsToWindow(working, windowId, activeWorkspaceId);
     let openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
 
     let finalState = working;
-    if (ensured.changed || openTabsResult.changed || visibilityResult.changed || restoreResult.restoredCount > 0) {
+    if (ensured.changed || openTabsResult.changed || visibilityResult.changed) {
       finalState = await saveState(working);
       await notifyStateUpdated();
     }
