@@ -750,12 +750,37 @@ async function syncNow() {
   });
 }
 
-function buildStateBackup(state) {
+function sanitizeStateForPortableTransfer(state, options = {}) {
+  const { syncedOpenTabsByWorkspace = {} } = options;
+  const normalized = normalizeState(state);
+
+  for (const workspace of Object.values(normalized.workspaces || {})) {
+    const parkedTabs = dedupeTabRecords(Array.isArray(workspace?.parkedTabs) ? workspace.parkedTabs : []);
+    const sleepingTabs = dedupeTabRecords(Array.isArray(workspace?.sessionTabs) ? workspace.sessionTabs : []);
+    workspace.sessionTabs = dedupeTabRecords([...parkedTabs, ...sleepingTabs]);
+    workspace.parkedTabs = [];
+  }
+
+  normalized.activeWorkspaceByWindow = {};
+  normalized.tabWorkspaceById = {};
+  normalized.deferredSleepByWindow = {};
+  normalized.parkedWindowByWorkspace = {};
+  normalized.syncedOpenTabsByWorkspace = normalizeSyncedOpenTabsByWorkspace(syncedOpenTabsByWorkspace);
+
+  return normalizeState(normalized);
+}
+
+async function buildStateBackup(state) {
+  const syncedOpenTabsByWorkspace = await collectOpenTabsByWorkspace(state);
+  const portableState = sanitizeStateForPortableTransfer(state, {
+    syncedOpenTabsByWorkspace
+  });
+
   return {
     schemaVersion: 1,
     exportedAt: now(),
     app: "ordinator",
-    state: normalizeState(state)
+    state: portableState
   };
 }
 
@@ -765,12 +790,16 @@ function extractStateFromBackup(payload) {
   }
 
   if (payload.state && typeof payload.state === "object") {
-    return normalizeState(payload.state);
+    return sanitizeStateForPortableTransfer(payload.state, {
+      syncedOpenTabsByWorkspace: payload.state.syncedOpenTabsByWorkspace
+    });
   }
 
   // Support direct state dumps too.
   if (payload.workspaces && typeof payload.workspaces === "object") {
-    return normalizeState(payload);
+    return sanitizeStateForPortableTransfer(payload, {
+      syncedOpenTabsByWorkspace: payload.syncedOpenTabsByWorkspace
+    });
   }
 
   throw new Error("Backup file is missing state data.");
