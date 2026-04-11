@@ -1081,6 +1081,97 @@ async function cleanupParkedWindow(state, workspaceId) {
   }
 }
 
+async function collapseParkedWorkspaceWindow(state, workspaceId) {
+  const workspace = state.workspaces[workspaceId];
+  if (!workspace) {
+    delete state.parkedWindowByWorkspace[workspaceId];
+    return { changed: false, collapsedCount: 0 };
+  }
+
+  const parkedWindowId = await getValidParkedWindowId(state, workspaceId);
+  let records = dedupeTabRecords(Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs : []);
+  let changed = records.length > 0 || Number.isFinite(parkedWindowId);
+
+  if (Number.isFinite(parkedWindowId)) {
+    try {
+      const parkedTabs = await chrome.tabs.query({ windowId: parkedWindowId });
+      const workspaceTabs = parkedTabs.filter(
+        (tab) =>
+          Number.isFinite(tab.id) &&
+          !tab.pinned &&
+          isOpenableUrl(tab.url) &&
+          state.tabWorkspaceById[String(tab.id)] === workspaceId
+      );
+      const liveRecords = dedupeTabRecords(workspaceTabs.map(tabToRecord));
+      if (liveRecords.length > 0) {
+        records = liveRecords;
+      }
+      removeTabAssignments(state, workspaceTabs.map((tab) => tab.id));
+    } catch (error) {
+      console.warn("Could not inspect parked window during repair:", parkedWindowId, error);
+    }
+
+    delete state.parkedWindowByWorkspace[workspaceId];
+    try {
+      await chrome.windows.remove(parkedWindowId);
+    } catch (error) {
+      // Window may already be gone.
+    }
+  }
+
+  if (records.length > 0) {
+    appendSleepingTabs(workspace, records);
+  }
+  if (Array.isArray(workspace.parkedTabs) && workspace.parkedTabs.length > 0) {
+    workspace.parkedTabs = [];
+  }
+  clearDeferredSleepForWorkspace(state, workspaceId);
+  if (changed) {
+    workspace.updatedAt = now();
+  }
+
+  return { changed, collapsedCount: records.length };
+}
+
+async function repairParkedWorkspaceWindows() {
+  return queueOperation(async () => {
+    const state = await loadState();
+    const workspaceIds = Object.keys(state.parkedWindowByWorkspace || {});
+    const orphanedParkedTabs = Object.values(state.workspaces || {}).some(
+      (workspace) => Array.isArray(workspace?.parkedTabs) && workspace.parkedTabs.length > 0
+    );
+
+    if (workspaceIds.length === 0 && !orphanedParkedTabs) {
+      return { repaired: false, collapsedCount: 0 };
+    }
+
+    const working = structuredClone(state);
+    let changed = false;
+    let collapsedCount = 0;
+
+    const candidateWorkspaceIds = new Set([
+      ...Object.keys(working.parkedWindowByWorkspace || {}),
+      ...Object.entries(working.workspaces || {})
+        .filter(([_workspaceId, workspace]) => Array.isArray(workspace?.parkedTabs) && workspace.parkedTabs.length > 0)
+        .map(([workspaceId]) => workspaceId)
+    ]);
+
+    for (const workspaceId of candidateWorkspaceIds) {
+      const result = await collapseParkedWorkspaceWindow(working, workspaceId);
+      changed = changed || result.changed;
+      collapsedCount += result.collapsedCount;
+    }
+
+    if (!changed) {
+      return { repaired: false, collapsedCount: 0 };
+    }
+
+    await saveState(working);
+    await notifyStateUpdated();
+    return { repaired: true, collapsedCount };
+  });
+}
+
 function addWorkspaceToState(state, preferredName = null) {
   const workspaceCount = state.workspaceOrder.length + (state.archivedWorkspaceOrder || []).length;
   const workspaceName = normalizeText(preferredName, `Workspace ${workspaceCount + 1}`);
@@ -2393,6 +2484,7 @@ async function handleMessage(message) {
 chrome.runtime.onInstalled.addListener((details) => {
   void (async () => {
     await loadState();
+    await repairParkedWorkspaceWindows();
     await ensureAlarm();
     scheduleSyncExport(1000);
 
@@ -2409,6 +2501,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 chrome.runtime.onStartup.addListener(() => {
   void (async () => {
     await loadState();
+    await repairParkedWorkspaceWindows();
     await ensureAlarm();
     scheduleSyncExport(1000);
     await openDashboardInAllNormalWindows();
