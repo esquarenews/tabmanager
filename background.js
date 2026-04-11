@@ -472,8 +472,9 @@ async function loadSyncSnapshot() {
 function mergeSyncSnapshotIntoState(state, syncSnapshot) {
   const working = structuredClone(state);
   if (!syncSnapshot) {
-    working.syncedOpenTabsByWorkspace = normalizeSyncedOpenTabsByWorkspace(working.syncedOpenTabsByWorkspace);
-    return { state: working, changed: false };
+    const hadSyncedOpenTabs = Object.keys(working.syncedOpenTabsByWorkspace || {}).length > 0;
+    working.syncedOpenTabsByWorkspace = {};
+    return { state: normalizeState(working), changed: hadSyncedOpenTabs };
   }
 
   let changed = false;
@@ -484,9 +485,7 @@ function mergeSyncSnapshotIntoState(state, syncSnapshot) {
         Array.isArray(workspace?.sessionTabs) && workspace.sessionTabs.length > 0 ||
         Array.isArray(workspace?.resources) && workspace.resources.length > 0 ||
         Array.isArray(workspace?.history) && workspace.history.length > 0 ||
-        normalizeText(workspace?.name, "Workspace 1") !== "Workspace 1" ||
-        Array.isArray(working.syncedOpenTabsByWorkspace?.[workspace?.id]) &&
-          working.syncedOpenTabsByWorkspace[workspace.id].length > 0
+        normalizeText(workspace?.name, "Workspace 1") !== "Workspace 1"
     );
   const preferSyncWorkspaceMetadata = !localHasMeaningfulData;
 
@@ -560,9 +559,8 @@ function mergeSyncSnapshotIntoState(state, syncSnapshot) {
     changed = true;
   }
 
-  const nextSyncedOpenTabs = normalizeSyncedOpenTabsByWorkspace(syncSnapshot.openTabsByWorkspace);
-  if (JSON.stringify(working.syncedOpenTabsByWorkspace || {}) !== JSON.stringify(nextSyncedOpenTabs)) {
-    working.syncedOpenTabsByWorkspace = nextSyncedOpenTabs;
+  if (Object.keys(working.syncedOpenTabsByWorkspace || {}).length > 0) {
+    working.syncedOpenTabsByWorkspace = {};
     changed = true;
   }
 
@@ -665,18 +663,6 @@ function buildSyncSnapshot(state, openTabsByWorkspace) {
     };
   }
 
-  const flattenedOpenTabs = [];
-  for (const [workspaceId, records] of Object.entries(openTabsByWorkspace || {})) {
-    for (const record of dedupeTabRecords(records)) {
-      flattenedOpenTabs.push({
-        workspaceId,
-        url: record.url,
-        title: normalizeText(record.title, record.url)
-      });
-    }
-  }
-
-  const openTabChunks = chunkSyncedOpenTabs(flattenedOpenTabs);
   return {
     meta: {
       version: 1,
@@ -684,17 +670,16 @@ function buildSyncSnapshot(state, openTabsByWorkspace) {
       workspaceOrder: Array.isArray(state.workspaceOrder) ? [...state.workspaceOrder] : [],
       archivedWorkspaceOrder: Array.isArray(state.archivedWorkspaceOrder) ? [...state.archivedWorkspaceOrder] : [],
       workspaces,
-      chunkCount: openTabChunks.length
+      chunkCount: 0
     },
-    openTabChunks
+    openTabChunks: []
   };
 }
 
 async function exportSyncSnapshot() {
   try {
     const baseState = stateCache ? structuredClone(stateCache) : await loadState();
-    const openTabsByWorkspace = await collectOpenTabsByWorkspace(baseState);
-    const snapshot = buildSyncSnapshot(baseState, openTabsByWorkspace);
+    const snapshot = buildSyncSnapshot(baseState);
     const nextItems = {
       [SYNC_META_KEY]: snapshot.meta
     };
@@ -751,13 +736,18 @@ async function syncNow() {
 }
 
 function sanitizeStateForPortableTransfer(state, options = {}) {
-  const { syncedOpenTabsByWorkspace = {} } = options;
+  const { openTabsByWorkspace = {} } = options;
   const normalized = normalizeState(state);
+  const portableOpenTabsByWorkspace = normalizeSyncedOpenTabsByWorkspace({
+    ...(normalized.syncedOpenTabsByWorkspace || {}),
+    ...(openTabsByWorkspace || {})
+  });
 
   for (const workspace of Object.values(normalized.workspaces || {})) {
     const parkedTabs = dedupeTabRecords(Array.isArray(workspace?.parkedTabs) ? workspace.parkedTabs : []);
     const sleepingTabs = dedupeTabRecords(Array.isArray(workspace?.sessionTabs) ? workspace.sessionTabs : []);
-    workspace.sessionTabs = dedupeTabRecords([...parkedTabs, ...sleepingTabs]);
+    const openTabs = dedupeTabRecords(portableOpenTabsByWorkspace[workspace.id] || []);
+    workspace.sessionTabs = dedupeTabRecords([...openTabs, ...parkedTabs, ...sleepingTabs]);
     workspace.parkedTabs = [];
   }
 
@@ -765,15 +755,15 @@ function sanitizeStateForPortableTransfer(state, options = {}) {
   normalized.tabWorkspaceById = {};
   normalized.deferredSleepByWindow = {};
   normalized.parkedWindowByWorkspace = {};
-  normalized.syncedOpenTabsByWorkspace = normalizeSyncedOpenTabsByWorkspace(syncedOpenTabsByWorkspace);
+  normalized.syncedOpenTabsByWorkspace = {};
 
   return normalizeState(normalized);
 }
 
 async function buildStateBackup(state) {
-  const syncedOpenTabsByWorkspace = await collectOpenTabsByWorkspace(state);
+  const openTabsByWorkspace = await collectOpenTabsByWorkspace(state);
   const portableState = sanitizeStateForPortableTransfer(state, {
-    syncedOpenTabsByWorkspace
+    openTabsByWorkspace
   });
 
   return {
@@ -791,14 +781,14 @@ function extractStateFromBackup(payload) {
 
   if (payload.state && typeof payload.state === "object") {
     return sanitizeStateForPortableTransfer(payload.state, {
-      syncedOpenTabsByWorkspace: payload.state.syncedOpenTabsByWorkspace
+      openTabsByWorkspace: payload.state.syncedOpenTabsByWorkspace
     });
   }
 
   // Support direct state dumps too.
   if (payload.workspaces && typeof payload.workspaces === "object") {
     return sanitizeStateForPortableTransfer(payload, {
-      syncedOpenTabsByWorkspace: payload.syncedOpenTabsByWorkspace
+      openTabsByWorkspace: payload.syncedOpenTabsByWorkspace
     });
   }
 
@@ -858,7 +848,7 @@ async function loadState() {
   // One-time migration path from older sync-based storage.
   const syncStored = await chrome.storage.sync.get(STORAGE_KEY);
   if (syncStored[STORAGE_KEY]) {
-    const normalized = normalizeState(syncStored[STORAGE_KEY]);
+    const normalized = mergeSyncSnapshotIntoState(normalizeState(syncStored[STORAGE_KEY]), null).state;
     stateCache = normalized;
     await chrome.storage.local.set({ [STORAGE_KEY]: normalized });
     try {
@@ -1500,12 +1490,6 @@ function tabToRecord(tab) {
   };
 }
 
-function getSyncedOpenTabsForWorkspace(state, workspaceId) {
-  return dedupeTabRecords(
-    Array.isArray(state.syncedOpenTabsByWorkspace?.[workspaceId]) ? state.syncedOpenTabsByWorkspace[workspaceId] : []
-  );
-}
-
 function appendSleepingTabs(workspace, records) {
   workspace.sessionTabs = dedupeTabRecords([...(records || []), ...(workspace.sessionTabs || [])]);
 }
@@ -1672,10 +1656,8 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId) {
   });
 
   if (visibleTargetTabs.length === 0) {
-    const syncedOpenTabs = getSyncedOpenTabsForWorkspace(state, targetWorkspaceId);
     const shouldOpenSleepingTabs = targetWorkspace.sessionTabs.length > 0;
-    const recordsToOpen = shouldOpenSleepingTabs ? targetWorkspace.sessionTabs : syncedOpenTabs;
-    const openResult = await openTabRecords(windowId, recordsToOpen, {
+    const openResult = await openTabRecords(windowId, targetWorkspace.sessionTabs, {
       openFallback: false,
       activateFirst: false
     });
@@ -1966,13 +1948,6 @@ async function getOpenTabCounts(state) {
     counts[workspaceId] = (counts[workspaceId] || 0) + 1;
   }
 
-  for (const [workspaceId, records] of Object.entries(state.syncedOpenTabsByWorkspace || {})) {
-    if (!state.workspaces[workspaceId] || counts[workspaceId] > 0) {
-      continue;
-    }
-    counts[workspaceId] = dedupeTabRecords(records).length;
-  }
-
   return counts;
 }
 
@@ -2009,24 +1984,9 @@ async function getDashboardData(windowId) {
     const visibilityResult = await syncWindowWorkspaceVisibility(working, windowId, activeWorkspaceId);
     const restoreResult = await restoreParkedWorkspaceTabsToWindow(working, windowId, activeWorkspaceId);
     let openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
-    let openedSyncedTabs = 0;
-
-    const activeWorkspace = working.workspaces[activeWorkspaceId];
-    const syncedOpenTabs = getSyncedOpenTabsForWorkspace(working, activeWorkspaceId);
-    if (activeWorkspace && openTabsResult.openTabs.length === 0 && activeWorkspace.sessionTabs.length === 0 && syncedOpenTabs.length > 0) {
-      const openResult = await openTabRecords(windowId, syncedOpenTabs, {
-        openFallback: false,
-        activateFirst: false
-      });
-      setTabAssignments(working, openResult.tabIds, activeWorkspaceId);
-      openedSyncedTabs = openResult.openedCount;
-      if (openResult.openedCount > 0) {
-        openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
-      }
-    }
 
     let finalState = working;
-    if (ensured.changed || openTabsResult.changed || visibilityResult.changed || restoreResult.restoredCount > 0 || openedSyncedTabs > 0) {
+    if (ensured.changed || openTabsResult.changed || visibilityResult.changed || restoreResult.restoredCount > 0) {
       finalState = await saveState(working);
       await notifyStateUpdated();
     }
