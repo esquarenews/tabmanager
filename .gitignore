@@ -1,2 +1,5 @@
 .chrome-extension-dev-key.pem
 dist/
+
+__pycache__/
+*.pyc
