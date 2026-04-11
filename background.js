@@ -1,9 +1,13 @@
 const STORAGE_KEY = "workspace_tab_manager_state";
+const SYNC_META_KEY = "workspace_tab_manager_sync_meta_v1";
+const SYNC_OPEN_TABS_KEY_PREFIX = "workspace_tab_manager_sync_tabs_v1_";
 const MEMORY_ALARM = "workspace_tab_memory_sweep";
 const NEW_TAB_URL = "chrome://newtab/";
 const DASHBOARD_PATH = "dashboard.html";
 const OPENABLE_URL_REGEX = /^https?:\/\//i;
 const HEX_COLOR_REGEX = /^#[0-9a-fA-F]{6}$/;
+const SYNC_OPEN_TABS_TARGET_ITEM_BYTES = 7000;
+const SYNC_EXPORT_DEBOUNCE_MS = 2500;
 const WORKSPACE_COLORS = Object.freeze([
   "#2563EB",
   "#7C3AED",
@@ -26,6 +30,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 
 let stateCache = null;
 let operationQueue = Promise.resolve();
+let syncExportTimer = null;
 
 function now() {
   return Date.now();
@@ -149,6 +154,25 @@ function normalizeHistory(snapshots) {
   return output;
 }
 
+function normalizeSyncedOpenTabsByWorkspace(value) {
+  const output = {};
+  if (!value || typeof value !== "object") {
+    return output;
+  }
+
+  for (const [workspaceId, records] of Object.entries(value)) {
+    if (typeof workspaceId !== "string") {
+      continue;
+    }
+    const tabs = dedupeTabRecords(Array.isArray(records) ? records : []);
+    if (tabs.length > 0) {
+      output[workspaceId] = tabs;
+    }
+  }
+
+  return output;
+}
+
 function createWorkspace(name, preferredColor = null) {
   const id = makeId("ws");
   const timestamp = now();
@@ -180,7 +204,8 @@ function createInitialState() {
     activeWorkspaceByWindow: {},
     tabWorkspaceById: {},
     deferredSleepByWindow: {},
-    parkedWindowByWorkspace: {}
+    parkedWindowByWorkspace: {},
+    syncedOpenTabsByWorkspace: {}
   };
 }
 
@@ -339,8 +364,332 @@ function normalizeState(state) {
     activeWorkspaceByWindow,
     tabWorkspaceById,
     deferredSleepByWindow,
-    parkedWindowByWorkspace
+    parkedWindowByWorkspace,
+    syncedOpenTabsByWorkspace: normalizeSyncedOpenTabsByWorkspace(state.syncedOpenTabsByWorkspace)
   };
+}
+
+function createWorkspaceFromSyncRecord(workspaceId, record) {
+  const timestamp = Number.isFinite(record?.updatedAt) ? record.updatedAt : now();
+  return {
+    id: workspaceId,
+    name: normalizeText(record?.name, "Workspace"),
+    color: normalizeWorkspaceColor(record?.color, workspaceId),
+    parkedTabs: [],
+    sessionTabs: [],
+    resources: [],
+    history: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastActivatedAt: null,
+    archivedAt: Number.isFinite(record?.archivedAt) ? record.archivedAt : null
+  };
+}
+
+function normalizeSyncMeta(meta) {
+  if (!meta || typeof meta !== "object") {
+    return null;
+  }
+
+  const workspaces = {};
+  if (meta.workspaces && typeof meta.workspaces === "object") {
+    for (const [workspaceId, record] of Object.entries(meta.workspaces)) {
+      if (typeof workspaceId !== "string" || !record || typeof record !== "object") {
+        continue;
+      }
+      workspaces[workspaceId] = {
+        id: workspaceId,
+        name: normalizeText(record.name, "Workspace"),
+        color: normalizeWorkspaceColor(record.color, workspaceId),
+        archivedAt: Number.isFinite(record.archivedAt) ? record.archivedAt : null,
+        updatedAt: Number.isFinite(record.updatedAt) ? record.updatedAt : now()
+      };
+    }
+  }
+
+  const workspaceOrder = Array.isArray(meta.workspaceOrder)
+    ? meta.workspaceOrder.filter((workspaceId) => typeof workspaceId === "string" && workspaces[workspaceId])
+    : [];
+  const archivedWorkspaceOrder = Array.isArray(meta.archivedWorkspaceOrder)
+    ? meta.archivedWorkspaceOrder.filter((workspaceId) => typeof workspaceId === "string" && workspaces[workspaceId])
+    : [];
+
+  const seen = new Set([...workspaceOrder, ...archivedWorkspaceOrder]);
+  for (const workspaceId of Object.keys(workspaces)) {
+    if (seen.has(workspaceId)) {
+      continue;
+    }
+    if (Number.isFinite(workspaces[workspaceId].archivedAt)) {
+      archivedWorkspaceOrder.push(workspaceId);
+    } else {
+      workspaceOrder.push(workspaceId);
+    }
+  }
+
+  return {
+    version: Number.isFinite(meta.version) ? meta.version : 1,
+    updatedAt: Number.isFinite(meta.updatedAt) ? meta.updatedAt : now(),
+    chunkCount: Math.max(0, Number(meta.chunkCount) || 0),
+    workspaceOrder,
+    archivedWorkspaceOrder,
+    workspaces
+  };
+}
+
+async function loadSyncSnapshot() {
+  const metaStored = await chrome.storage.sync.get(SYNC_META_KEY);
+  const meta = normalizeSyncMeta(metaStored[SYNC_META_KEY]);
+  if (!meta) {
+    return null;
+  }
+
+  const chunkKeys = Array.from({ length: meta.chunkCount }, (_value, index) => `${SYNC_OPEN_TABS_KEY_PREFIX}${index}`);
+  const chunkStored = chunkKeys.length > 0 ? await chrome.storage.sync.get(chunkKeys) : {};
+  const openTabsByWorkspace = {};
+
+  for (const chunkKey of chunkKeys) {
+    const chunk = Array.isArray(chunkStored[chunkKey]) ? chunkStored[chunkKey] : [];
+    for (const record of chunk) {
+      if (!record || typeof record !== "object" || typeof record.workspaceId !== "string") {
+        continue;
+      }
+      if (!openTabsByWorkspace[record.workspaceId]) {
+        openTabsByWorkspace[record.workspaceId] = [];
+      }
+      openTabsByWorkspace[record.workspaceId].push({
+        url: record.url,
+        title: record.title
+      });
+    }
+  }
+
+  return {
+    ...meta,
+    openTabsByWorkspace: normalizeSyncedOpenTabsByWorkspace(openTabsByWorkspace)
+  };
+}
+
+function mergeSyncSnapshotIntoState(state, syncSnapshot) {
+  const working = structuredClone(state);
+  if (!syncSnapshot) {
+    working.syncedOpenTabsByWorkspace = normalizeSyncedOpenTabsByWorkspace(working.syncedOpenTabsByWorkspace);
+    return { state: working, changed: false };
+  }
+
+  let changed = false;
+
+  for (const [workspaceId, syncedWorkspace] of Object.entries(syncSnapshot.workspaces)) {
+    const localWorkspace = working.workspaces[workspaceId];
+    if (!localWorkspace) {
+      working.workspaces[workspaceId] = createWorkspaceFromSyncRecord(workspaceId, syncedWorkspace);
+      changed = true;
+      continue;
+    }
+
+    const localUpdatedAt = Number.isFinite(localWorkspace.updatedAt) ? localWorkspace.updatedAt : 0;
+    const syncedUpdatedAt = Number.isFinite(syncedWorkspace.updatedAt) ? syncedWorkspace.updatedAt : 0;
+    if (syncedUpdatedAt < localUpdatedAt) {
+      continue;
+    }
+
+    if (localWorkspace.name !== syncedWorkspace.name) {
+      localWorkspace.name = syncedWorkspace.name;
+      changed = true;
+    }
+    if (localWorkspace.color !== syncedWorkspace.color) {
+      localWorkspace.color = syncedWorkspace.color;
+      changed = true;
+    }
+
+    const nextArchivedAt = Number.isFinite(syncedWorkspace.archivedAt) ? syncedWorkspace.archivedAt : null;
+    if ((Number.isFinite(localWorkspace.archivedAt) ? localWorkspace.archivedAt : null) !== nextArchivedAt) {
+      localWorkspace.archivedAt = nextArchivedAt;
+      changed = true;
+    }
+
+    if (localWorkspace.updatedAt !== syncedUpdatedAt) {
+      localWorkspace.updatedAt = syncedUpdatedAt;
+      changed = true;
+    }
+  }
+
+  const nextWorkspaceOrder = syncSnapshot.workspaceOrder.filter(
+    (workspaceId) => working.workspaces[workspaceId] && !Number.isFinite(working.workspaces[workspaceId].archivedAt)
+  );
+  for (const workspaceId of working.workspaceOrder) {
+    if (
+      working.workspaces[workspaceId] &&
+      !Number.isFinite(working.workspaces[workspaceId].archivedAt) &&
+      !nextWorkspaceOrder.includes(workspaceId)
+    ) {
+      nextWorkspaceOrder.push(workspaceId);
+    }
+  }
+
+  const nextArchivedWorkspaceOrder = syncSnapshot.archivedWorkspaceOrder.filter(
+    (workspaceId) => working.workspaces[workspaceId] && Number.isFinite(working.workspaces[workspaceId].archivedAt)
+  );
+  for (const workspaceId of working.archivedWorkspaceOrder || []) {
+    if (
+      working.workspaces[workspaceId] &&
+      Number.isFinite(working.workspaces[workspaceId].archivedAt) &&
+      !nextArchivedWorkspaceOrder.includes(workspaceId)
+    ) {
+      nextArchivedWorkspaceOrder.push(workspaceId);
+    }
+  }
+
+  if (JSON.stringify(working.workspaceOrder) !== JSON.stringify(nextWorkspaceOrder)) {
+    working.workspaceOrder = nextWorkspaceOrder;
+    changed = true;
+  }
+  if (JSON.stringify(working.archivedWorkspaceOrder) !== JSON.stringify(nextArchivedWorkspaceOrder)) {
+    working.archivedWorkspaceOrder = nextArchivedWorkspaceOrder;
+    changed = true;
+  }
+
+  const nextSyncedOpenTabs = normalizeSyncedOpenTabsByWorkspace(syncSnapshot.openTabsByWorkspace);
+  if (JSON.stringify(working.syncedOpenTabsByWorkspace || {}) !== JSON.stringify(nextSyncedOpenTabs)) {
+    working.syncedOpenTabsByWorkspace = nextSyncedOpenTabs;
+    changed = true;
+  }
+
+  return {
+    state: normalizeState(working),
+    changed
+  };
+}
+
+function syncOpenTabsChunkKey(index) {
+  return `${SYNC_OPEN_TABS_KEY_PREFIX}${index}`;
+}
+
+function estimateSyncItemBytes(key, value) {
+  return JSON.stringify(value).length + String(key).length;
+}
+
+function chunkSyncedOpenTabs(records) {
+  const chunks = [];
+  let current = [];
+
+  for (const record of records) {
+    const candidate = [...current, record];
+    if (current.length > 0 && estimateSyncItemBytes(syncOpenTabsChunkKey(chunks.length), candidate) > SYNC_OPEN_TABS_TARGET_ITEM_BYTES) {
+      chunks.push(current);
+      current = [record];
+    } else {
+      current = candidate;
+    }
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks;
+}
+
+async function collectOpenTabsByWorkspace(state) {
+  const openTabsByWorkspace = {};
+  const tabs = await chrome.tabs.query({});
+
+  for (const tab of tabs) {
+    if (!Number.isFinite(tab?.id) || !Number.isFinite(tab?.windowId) || tab.pinned || !isOpenableUrl(tab.url)) {
+      continue;
+    }
+
+    const workspaceId =
+      state.tabWorkspaceById[String(tab.id)] || state.activeWorkspaceByWindow[windowKey(tab.windowId)];
+    if (!workspaceId || !state.workspaces[workspaceId]) {
+      continue;
+    }
+
+    if (!openTabsByWorkspace[workspaceId]) {
+      openTabsByWorkspace[workspaceId] = [];
+    }
+
+    openTabsByWorkspace[workspaceId].push({
+      url: tab.url || "",
+      title: normalizeText(tab.title, tab.url || "Untitled")
+    });
+  }
+
+  return normalizeSyncedOpenTabsByWorkspace(openTabsByWorkspace);
+}
+
+function buildSyncSnapshot(state, openTabsByWorkspace) {
+  const workspaces = {};
+  for (const [workspaceId, workspace] of Object.entries(state.workspaces || {})) {
+    workspaces[workspaceId] = {
+      id: workspaceId,
+      name: normalizeText(workspace.name, "Workspace"),
+      color: normalizeWorkspaceColor(workspace.color, workspaceId),
+      archivedAt: Number.isFinite(workspace.archivedAt) ? workspace.archivedAt : null,
+      updatedAt: Number.isFinite(workspace.updatedAt) ? workspace.updatedAt : now()
+    };
+  }
+
+  const flattenedOpenTabs = [];
+  for (const [workspaceId, records] of Object.entries(openTabsByWorkspace || {})) {
+    for (const record of dedupeTabRecords(records)) {
+      flattenedOpenTabs.push({
+        workspaceId,
+        url: record.url,
+        title: normalizeText(record.title, record.url)
+      });
+    }
+  }
+
+  const openTabChunks = chunkSyncedOpenTabs(flattenedOpenTabs);
+  return {
+    meta: {
+      version: 1,
+      updatedAt: now(),
+      workspaceOrder: Array.isArray(state.workspaceOrder) ? [...state.workspaceOrder] : [],
+      archivedWorkspaceOrder: Array.isArray(state.archivedWorkspaceOrder) ? [...state.archivedWorkspaceOrder] : [],
+      workspaces,
+      chunkCount: openTabChunks.length
+    },
+    openTabChunks
+  };
+}
+
+async function exportSyncSnapshot() {
+  try {
+    const baseState = stateCache ? structuredClone(stateCache) : await loadState();
+    const openTabsByWorkspace = await collectOpenTabsByWorkspace(baseState);
+    const snapshot = buildSyncSnapshot(baseState, openTabsByWorkspace);
+    const nextItems = {
+      [SYNC_META_KEY]: snapshot.meta
+    };
+
+    snapshot.openTabChunks.forEach((chunk, index) => {
+      nextItems[syncOpenTabsChunkKey(index)] = chunk;
+    });
+
+    const existingSync = await chrome.storage.sync.get(null);
+    const removableKeys = Object.keys(existingSync).filter(
+      (key) => key === STORAGE_KEY || (key.startsWith(SYNC_OPEN_TABS_KEY_PREFIX) && !(key in nextItems))
+    );
+
+    if (removableKeys.length > 0) {
+      await chrome.storage.sync.remove(removableKeys);
+    }
+    await chrome.storage.sync.set(nextItems);
+  } catch (error) {
+    console.warn("Could not export synced workspaces/open tabs:", error);
+  }
+}
+
+function scheduleSyncExport(delay = SYNC_EXPORT_DEBOUNCE_MS) {
+  if (syncExportTimer) {
+    clearTimeout(syncExportTimer);
+  }
+
+  syncExportTimer = setTimeout(() => {
+    syncExportTimer = null;
+    void exportSyncSnapshot();
+  }, delay);
 }
 
 function queueOperation(task) {
@@ -357,8 +706,13 @@ async function loadState() {
   const localStored = await chrome.storage.local.get(STORAGE_KEY);
   if (localStored[STORAGE_KEY]) {
     const normalized = normalizeState(localStored[STORAGE_KEY]);
-    stateCache = normalized;
-    return structuredClone(normalized);
+    const syncSnapshot = await loadSyncSnapshot();
+    const merged = mergeSyncSnapshotIntoState(normalized, syncSnapshot);
+    stateCache = merged.state;
+    if (merged.changed) {
+      await chrome.storage.local.set({ [STORAGE_KEY]: merged.state });
+    }
+    return structuredClone(merged.state);
   }
 
   // One-time migration path from older sync-based storage.
@@ -375,7 +729,8 @@ async function loadState() {
     return structuredClone(normalized);
   }
 
-  const initial = createInitialState();
+  const syncSnapshot = await loadSyncSnapshot();
+  const initial = syncSnapshot ? mergeSyncSnapshotIntoState(createInitialState(), syncSnapshot).state : createInitialState();
   stateCache = initial;
   await chrome.storage.local.set({ [STORAGE_KEY]: initial });
   return structuredClone(initial);
@@ -385,6 +740,7 @@ async function saveState(nextState) {
   const normalized = normalizeState(nextState);
   stateCache = normalized;
   await chrome.storage.local.set({ [STORAGE_KEY]: normalized });
+  scheduleSyncExport();
   return structuredClone(normalized);
 }
 
@@ -1004,6 +1360,12 @@ function tabToRecord(tab) {
   };
 }
 
+function getSyncedOpenTabsForWorkspace(state, workspaceId) {
+  return dedupeTabRecords(
+    Array.isArray(state.syncedOpenTabsByWorkspace?.[workspaceId]) ? state.syncedOpenTabsByWorkspace[workspaceId] : []
+  );
+}
+
 function appendSleepingTabs(workspace, records) {
   workspace.sessionTabs = dedupeTabRecords([...(records || []), ...(workspace.sessionTabs || [])]);
 }
@@ -1170,13 +1532,16 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId) {
   });
 
   if (visibleTargetTabs.length === 0) {
-    const openResult = await openTabRecords(windowId, targetWorkspace.sessionTabs, {
+    const syncedOpenTabs = getSyncedOpenTabsForWorkspace(state, targetWorkspaceId);
+    const shouldOpenSleepingTabs = targetWorkspace.sessionTabs.length > 0;
+    const recordsToOpen = shouldOpenSleepingTabs ? targetWorkspace.sessionTabs : syncedOpenTabs;
+    const openResult = await openTabRecords(windowId, recordsToOpen, {
       openFallback: false,
       activateFirst: false
     });
     openedCount += openResult.openedCount;
     setTabAssignments(state, openResult.tabIds, targetWorkspaceId);
-    if (openResult.openedCount > 0) {
+    if (shouldOpenSleepingTabs && openResult.openedCount > 0) {
       targetWorkspace.sessionTabs = [];
     }
   }
@@ -1461,6 +1826,13 @@ async function getOpenTabCounts(state) {
     counts[workspaceId] = (counts[workspaceId] || 0) + 1;
   }
 
+  for (const [workspaceId, records] of Object.entries(state.syncedOpenTabsByWorkspace || {})) {
+    if (!state.workspaces[workspaceId] || counts[workspaceId] > 0) {
+      continue;
+    }
+    counts[workspaceId] = dedupeTabRecords(records).length;
+  }
+
   return counts;
 }
 
@@ -1496,10 +1868,25 @@ async function getDashboardData(windowId) {
     const activeWorkspaceId = ensured.workspaceId;
     const visibilityResult = await syncWindowWorkspaceVisibility(working, windowId, activeWorkspaceId);
     const restoreResult = await restoreParkedWorkspaceTabsToWindow(working, windowId, activeWorkspaceId);
-    const openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
+    let openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
+    let openedSyncedTabs = 0;
+
+    const activeWorkspace = working.workspaces[activeWorkspaceId];
+    const syncedOpenTabs = getSyncedOpenTabsForWorkspace(working, activeWorkspaceId);
+    if (activeWorkspace && openTabsResult.openTabs.length === 0 && activeWorkspace.sessionTabs.length === 0 && syncedOpenTabs.length > 0) {
+      const openResult = await openTabRecords(windowId, syncedOpenTabs, {
+        openFallback: false,
+        activateFirst: false
+      });
+      setTabAssignments(working, openResult.tabIds, activeWorkspaceId);
+      openedSyncedTabs = openResult.openedCount;
+      if (openResult.openedCount > 0) {
+        openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
+      }
+    }
 
     let finalState = working;
-    if (ensured.changed || openTabsResult.changed || visibilityResult.changed || restoreResult.restoredCount > 0) {
+    if (ensured.changed || openTabsResult.changed || visibilityResult.changed || restoreResult.restoredCount > 0 || openedSyncedTabs > 0) {
       finalState = await saveState(working);
       await notifyStateUpdated();
     }
@@ -1896,6 +2283,7 @@ chrome.runtime.onInstalled.addListener((details) => {
   void (async () => {
     await loadState();
     await ensureAlarm();
+    scheduleSyncExport(1000);
 
     if (details.reason === "install" || details.reason === "update") {
       try {
@@ -1911,6 +2299,7 @@ chrome.runtime.onStartup.addListener(() => {
   void (async () => {
     await loadState();
     await ensureAlarm();
+    scheduleSyncExport(1000);
     await openDashboardInAllNormalWindows();
   })();
 });
@@ -1923,6 +2312,7 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  scheduleSyncExport();
   void queueOperation(async () => {
     const state = await loadState();
     const key = String(tabId);
@@ -1951,7 +2341,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   });
 });
 
+chrome.tabs.onCreated.addListener(() => {
+  scheduleSyncExport();
+});
+
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+  if (changeInfo.status === "complete" || typeof changeInfo.title === "string" || typeof changeInfo.url === "string") {
+    scheduleSyncExport();
+  }
+});
+
 chrome.windows.onRemoved.addListener((windowId) => {
+  scheduleSyncExport();
   void queueOperation(async () => {
     const state = await loadState();
     const workspaceId = findWorkspaceIdByParkedWindow(state, windowId);
@@ -1976,6 +2377,22 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === MEMORY_ALARM) {
     void runMemorySweep();
   }
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "sync") {
+    return;
+  }
+
+  const hasRelevantChange = Object.keys(changes || {}).some(
+    (key) => key === STORAGE_KEY || key === SYNC_META_KEY || key.startsWith(SYNC_OPEN_TABS_KEY_PREFIX)
+  );
+  if (!hasRelevantChange) {
+    return;
+  }
+
+  stateCache = null;
+  void notifyStateUpdated();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
