@@ -610,8 +610,7 @@ async function collectOpenTabsByWorkspace(state) {
       continue;
     }
 
-    const workspaceId =
-      state.tabWorkspaceById[String(tab.id)] || state.activeWorkspaceByWindow[windowKey(tab.windowId)];
+    const workspaceId = state.tabWorkspaceById[String(tab.id)];
     if (!workspaceId || !state.workspaces[workspaceId]) {
       continue;
     }
@@ -627,6 +626,31 @@ async function collectOpenTabsByWorkspace(state) {
   }
 
   return normalizeSyncedOpenTabsByWorkspace(openTabsByWorkspace);
+}
+
+async function assignNewTabToActiveWorkspace(tab) {
+  if (!Number.isFinite(tab?.id) || !Number.isFinite(tab?.windowId) || tab.pinned || !isOpenableUrl(tab.url)) {
+    return false;
+  }
+
+  return queueOperation(async () => {
+    const state = await loadState();
+    const tabIdKey = String(tab.id);
+    if (state.tabWorkspaceById[tabIdKey]) {
+      return false;
+    }
+
+    const workspaceId = state.activeWorkspaceByWindow[windowKey(tab.windowId)];
+    if (!workspaceId || !state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
+      return false;
+    }
+
+    const working = structuredClone(state);
+    working.tabWorkspaceById[tabIdKey] = workspaceId;
+    await saveState(working);
+    await notifyStateUpdated();
+    return true;
+  });
 }
 
 function buildSyncSnapshot(state, openTabsByWorkspace) {
@@ -2440,11 +2464,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   });
 });
 
-chrome.tabs.onCreated.addListener(() => {
+chrome.tabs.onCreated.addListener((tab) => {
+  void assignNewTabToActiveWorkspace(tab);
   scheduleSyncExport();
 });
 
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if ((typeof changeInfo.url === "string" || changeInfo.status === "complete") && tab) {
+    void assignNewTabToActiveWorkspace(tab);
+  }
   if (changeInfo.status === "complete" || typeof changeInfo.title === "string" || typeof changeInfo.url === "string") {
     scheduleSyncExport();
   }
