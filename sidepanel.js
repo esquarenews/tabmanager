@@ -360,6 +360,27 @@ async function send(action, payload = {}) {
   return response.result;
 }
 
+function downloadJsonFile(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Could not read backup file."));
+    reader.readAsText(file);
+  });
+}
+
 function debounceRefresh() {
   if (state.refreshTimer) {
     clearTimeout(state.refreshTimer);
@@ -1366,6 +1387,69 @@ function renderSettingsView() {
 
   managerSection.appendChild(archivedList);
   root.appendChild(managerSection);
+
+  const backupSection = document.createElement("section");
+  backupSection.className = "section";
+  backupSection.innerHTML = `
+    <h3>Backup & Restore</h3>
+    <p class="section-note">Export the full local workspace state before switching extension IDs, then import it into the new install to preserve workspaces, tabs, history, resources, and settings.</p>
+  `;
+
+  const backupActions = document.createElement("div");
+  backupActions.className = "settings-action-row";
+
+  const exportButton = document.createElement("button");
+  exportButton.type = "button";
+  exportButton.className = "primary";
+  exportButton.textContent = "Export Backup";
+  exportButton.addEventListener("click", () => {
+    void runAction(async () => {
+      const backup = await send("EXPORT_STATE_BACKUP", {
+        windowId: state.windowId
+      });
+      const exportedAt = new Date(backup.exportedAt || Date.now()).toISOString().replace(/[:.]/g, "-");
+      downloadJsonFile(`ordinator-backup-${exportedAt}.json`, backup);
+    }, "Backup exported.");
+  });
+
+  const importButton = document.createElement("button");
+  importButton.type = "button";
+  importButton.textContent = "Import Backup";
+
+  const importInput = document.createElement("input");
+  importInput.type = "file";
+  importInput.accept = "application/json,.json";
+  importInput.hidden = true;
+
+  importButton.addEventListener("click", () => {
+    importInput.click();
+  });
+
+  importInput.addEventListener("change", () => {
+    const [file] = Array.from(importInput.files || []);
+    importInput.value = "";
+    if (!file) {
+      return;
+    }
+
+    const confirmed = window.confirm("Importing a backup will replace the current local workspace state on this browser profile. Continue?");
+    if (!confirmed) {
+      return;
+    }
+
+    void runAction(async () => {
+      const raw = await readFileAsText(file);
+      const backup = JSON.parse(raw);
+      await send("IMPORT_STATE_BACKUP", {
+        windowId: state.windowId,
+        backup
+      });
+    }, "Backup imported.");
+  });
+
+  backupActions.append(exportButton, importButton, importInput);
+  backupSection.appendChild(backupActions);
+  root.appendChild(backupSection);
   return root;
 }
 

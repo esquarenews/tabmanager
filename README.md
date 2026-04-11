@@ -56,6 +56,28 @@ Chrome extension that organizes tabs by workspace in a full dashboard browser ta
 5. Pin the extension and click its icon.
 6. The extension opens/focuses a `dashboard.html` tab with workspace controls.
 
+## Stable Extension ID
+
+- `manifest.json` includes a stable public `"key"` so unpacked installs use the same extension ID on every machine.
+- The matching private key is stored locally in `.chrome-extension-dev-key.pem` and is ignored by git.
+- For day-to-day development on another machine, you only need the repo contents with the committed `manifest.json` key.
+- Only copy `.chrome-extension-dev-key.pem` securely if you also need to re-key or package the extension from that machine.
+
+### Key Workflow
+
+1. Generate the local private key once:
+   - `openssl genrsa -out .chrome-extension-dev-key.pem 2048`
+2. Refresh the public manifest key if the private key ever changes:
+   - `python3 scripts/update_manifest_key.py`
+3. Reload the unpacked extension in Chrome on each machine.
+
+### Package Workflow
+
+1. Make sure `.chrome-extension-dev-key.pem` exists locally.
+2. Package with the same key:
+   - `scripts/package_extension.sh`
+3. The packaged `.crx` is written to `dist/ordinator.crx`.
+
 ## Notes / Limitations
 
 - Uses `chrome.storage.local` to avoid `chrome.storage.sync` per-item quota limits for large workspace state.

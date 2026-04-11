@@ -799,6 +799,12 @@ input[type="url"] {
   gap: 8px;
 }
 
+.settings-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .toast {
   margin-top: 8px;
   min-height: 18px;

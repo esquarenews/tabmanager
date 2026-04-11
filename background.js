@@ -477,6 +477,18 @@ function mergeSyncSnapshotIntoState(state, syncSnapshot) {
   }
 
   let changed = false;
+  const localHasMeaningfulData =
+    Object.keys(working.workspaces || {}).length > 1 ||
+    Object.values(working.workspaces || {}).some(
+      (workspace) =>
+        Array.isArray(workspace?.sessionTabs) && workspace.sessionTabs.length > 0 ||
+        Array.isArray(workspace?.resources) && workspace.resources.length > 0 ||
+        Array.isArray(workspace?.history) && workspace.history.length > 0 ||
+        normalizeText(workspace?.name, "Workspace 1") !== "Workspace 1" ||
+        Array.isArray(working.syncedOpenTabsByWorkspace?.[workspace?.id]) &&
+          working.syncedOpenTabsByWorkspace[workspace.id].length > 0
+    );
+  const preferSyncWorkspaceMetadata = !localHasMeaningfulData;
 
   for (const [workspaceId, syncedWorkspace] of Object.entries(syncSnapshot.workspaces)) {
     const localWorkspace = working.workspaces[workspaceId];
@@ -488,7 +500,7 @@ function mergeSyncSnapshotIntoState(state, syncSnapshot) {
 
     const localUpdatedAt = Number.isFinite(localWorkspace.updatedAt) ? localWorkspace.updatedAt : 0;
     const syncedUpdatedAt = Number.isFinite(syncedWorkspace.updatedAt) ? syncedWorkspace.updatedAt : 0;
-    if (syncedUpdatedAt < localUpdatedAt) {
+    if (!preferSyncWorkspaceMetadata && syncedUpdatedAt < localUpdatedAt) {
       continue;
     }
 
@@ -710,6 +722,59 @@ async function syncNow() {
       synced: true,
       workspaceCount: savedState.workspaceOrder.length,
       syncedWorkspaceCount: Object.keys(savedState.syncedOpenTabsByWorkspace || {}).length
+    };
+  });
+}
+
+function buildStateBackup(state) {
+  return {
+    schemaVersion: 1,
+    exportedAt: now(),
+    app: "ordinator",
+    state: normalizeState(state)
+  };
+}
+
+function extractStateFromBackup(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Backup file is invalid.");
+  }
+
+  if (payload.state && typeof payload.state === "object") {
+    return normalizeState(payload.state);
+  }
+
+  // Support direct state dumps too.
+  if (payload.workspaces && typeof payload.workspaces === "object") {
+    return normalizeState(payload);
+  }
+
+  throw new Error("Backup file is missing state data.");
+}
+
+async function exportStateBackup() {
+  return queueOperation(async () => {
+    const state = stateCache ? structuredClone(stateCache) : await loadState();
+    return buildStateBackup(state);
+  });
+}
+
+async function importStateBackup(payload) {
+  return queueOperation(async () => {
+    if (syncExportTimer) {
+      clearTimeout(syncExportTimer);
+      syncExportTimer = null;
+    }
+
+    const importedState = extractStateFromBackup(payload);
+    const savedState = await saveState(importedState);
+    await exportSyncSnapshot();
+    await notifyStateUpdated();
+
+    return {
+      imported: true,
+      workspaceCount: savedState.workspaceOrder.length,
+      archivedWorkspaceCount: savedState.archivedWorkspaceOrder.length
     };
   });
 }
@@ -2294,6 +2359,14 @@ async function handleMessage(message) {
 
     case "SYNC_NOW": {
       return syncNow();
+    }
+
+    case "EXPORT_STATE_BACKUP": {
+      return exportStateBackup();
+    }
+
+    case "IMPORT_STATE_BACKUP": {
+      return importStateBackup(payload.backup);
     }
 
     case "OPEN_DASHBOARD": {
