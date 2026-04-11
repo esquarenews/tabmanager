@@ -8,6 +8,9 @@ const state = {
 
 const ui = {
   workspaceList: document.querySelector("#workspaceList"),
+  dashboardSearchForm: document.querySelector("#dashboardSearchForm"),
+  dashboardSearchInput: document.querySelector("#dashboardSearchInput"),
+  dashboardSearchDropdown: document.querySelector("#dashboardSearchDropdown"),
   workspaceNameButton: document.querySelector("#workspaceNameButton"),
   workspaceName: document.querySelector("#workspaceName"),
   workspaceMeta: document.querySelector("#workspaceMeta"),
@@ -25,6 +28,14 @@ const ui = {
 const dragState = {
   type: null,
   payload: null
+};
+
+const searchState = {
+  debounceTimer: null,
+  highlightedIndex: -1,
+  lastIssuedQuery: "",
+  requestId: 0,
+  results: []
 };
 
 const EXPANDED_PARKED_WORKSPACES_MIN_WIDTH = 1700;
@@ -141,6 +152,15 @@ function truncateDisplayText(value, maxLength = 56) {
     return text;
   }
   return `${text.slice(0, Math.max(1, maxLength - 1))}\u2026`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function formatDisplayUrl(url, options = {}) {
@@ -358,6 +378,156 @@ async function send(action, payload = {}) {
     throw new Error(response?.error || "Request failed.");
   }
   return response.result;
+}
+
+function searchKindLabel(kind) {
+  switch (kind) {
+    case "workspace":
+      return "Workspace";
+    case "open-tab":
+      return "Open";
+    case "sleeping-tab":
+      return "Sleeping";
+    case "history-tab":
+      return "History";
+    default:
+      return "Result";
+  }
+}
+
+function closeSearchDropdown() {
+  searchState.highlightedIndex = -1;
+  ui.dashboardSearchDropdown.hidden = true;
+  ui.dashboardSearchDropdown.innerHTML = "";
+  ui.dashboardSearchInput.setAttribute("aria-expanded", "false");
+}
+
+function renderSearchDropdown(message = "") {
+  const results = Array.isArray(searchState.results) ? searchState.results : [];
+  if (!searchState.lastIssuedQuery) {
+    closeSearchDropdown();
+    return;
+  }
+
+  ui.dashboardSearchDropdown.hidden = false;
+  ui.dashboardSearchInput.setAttribute("aria-expanded", "true");
+
+  if (message) {
+    ui.dashboardSearchDropdown.innerHTML = `<div class="dashboard-search-empty">${escapeHtml(message)}</div>`;
+    return;
+  }
+
+  if (results.length === 0) {
+    ui.dashboardSearchDropdown.innerHTML = '<div class="dashboard-search-empty">No matching workspaces or tabs.</div>';
+    return;
+  }
+
+  ui.dashboardSearchDropdown.innerHTML = `
+    <div class="dashboard-search-results">
+      ${results
+        .map((result, index) => {
+          const workspaceMeta = result.workspaceName ? `Workspace: ${result.workspaceName}` : "";
+          const extraMeta =
+            result.kind === "workspace"
+              ? `${result.openTabCount || 0} open • ${result.sleepingTabCount || 0} sleeping`
+              : workspaceMeta;
+          return `
+            <button
+              class="dashboard-search-result${index === searchState.highlightedIndex ? " active" : ""}"
+              type="button"
+              data-index="${index}"
+            >
+              <div class="dashboard-search-result-top">
+                <p class="dashboard-search-result-title">${escapeHtml(result.title || result.url || "Untitled")}</p>
+                <span class="dashboard-search-result-kind">${escapeHtml(searchKindLabel(result.kind))}</span>
+              </div>
+              ${extraMeta ? `<p class="dashboard-search-result-meta">${escapeHtml(extraMeta)}</p>` : ""}
+              ${result.url ? `<p class="dashboard-search-result-url">${escapeHtml(result.url)}</p>` : ""}
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function setSearchResults(query, results) {
+  searchState.lastIssuedQuery = query;
+  searchState.results = Array.isArray(results) ? results : [];
+  searchState.highlightedIndex = searchState.results.length > 0 ? 0 : -1;
+  renderSearchDropdown();
+}
+
+function updateSearchHighlight(nextIndex) {
+  if (!Array.isArray(searchState.results) || searchState.results.length === 0) {
+    return;
+  }
+  const maxIndex = searchState.results.length - 1;
+  searchState.highlightedIndex = Math.max(0, Math.min(maxIndex, nextIndex));
+  renderSearchDropdown();
+}
+
+async function openDashboardSearchResult(result) {
+  if (!result) {
+    return;
+  }
+
+  await send("OPEN_SEARCH_RESULT", {
+    windowId: state.windowId,
+    kind: result.kind,
+    workspaceId: result.workspaceId,
+    tabId: result.tabId,
+    url: result.url,
+    title: result.title,
+    snapshotId: result.snapshotId
+  });
+
+  ui.dashboardSearchInput.value = "";
+  searchState.lastIssuedQuery = "";
+  searchState.results = [];
+  closeSearchDropdown();
+  await refreshDashboard(true);
+}
+
+async function runWorkspaceSearch(query) {
+  const trimmedQuery = query.trim();
+  searchState.lastIssuedQuery = trimmedQuery;
+
+  if (!trimmedQuery) {
+    searchState.results = [];
+    closeSearchDropdown();
+    return;
+  }
+
+  const requestId = ++searchState.requestId;
+  renderSearchDropdown("Searching...");
+
+  try {
+    const response = await send("SEARCH_WORKSPACE_CONTENT", {
+      windowId: state.windowId,
+      query: trimmedQuery,
+      limit: 10
+    });
+
+    if (requestId !== searchState.requestId || ui.dashboardSearchInput.value.trim() !== trimmedQuery) {
+      return;
+    }
+
+    setSearchResults(trimmedQuery, response.results);
+  } catch (error) {
+    if (requestId !== searchState.requestId) {
+      return;
+    }
+    searchState.results = [];
+    renderSearchDropdown("Search is unavailable right now.");
+  }
+}
+
+function scheduleWorkspaceSearch() {
+  clearTimeout(searchState.debounceTimer);
+  searchState.debounceTimer = setTimeout(() => {
+    void runWorkspaceSearch(ui.dashboardSearchInput.value);
+  }, 120);
 }
 
 function downloadJsonFile(filename, payload) {
@@ -1523,6 +1693,85 @@ async function runAction(action, successMessage) {
 }
 
 function wireEvents() {
+  if (ui.dashboardSearchInput) {
+    ui.dashboardSearchInput.addEventListener("input", () => {
+      scheduleWorkspaceSearch();
+    });
+
+    ui.dashboardSearchInput.addEventListener("focus", () => {
+      if (searchState.lastIssuedQuery) {
+        renderSearchDropdown();
+      }
+    });
+
+    ui.dashboardSearchInput.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        updateSearchHighlight(searchState.highlightedIndex + 1);
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        updateSearchHighlight(searchState.highlightedIndex <= 0 ? 0 : searchState.highlightedIndex - 1);
+        return;
+      }
+
+      if (event.key === "Escape") {
+        closeSearchDropdown();
+        return;
+      }
+
+      if (event.key === "Enter") {
+        const result = searchState.results[searchState.highlightedIndex] || searchState.results[0];
+        if (result) {
+          event.preventDefault();
+          void openDashboardSearchResult(result);
+        }
+      }
+    });
+  }
+
+  if (ui.dashboardSearchForm) {
+    ui.dashboardSearchForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const result = searchState.results[searchState.highlightedIndex] || searchState.results[0];
+      if (result) {
+        void openDashboardSearchResult(result);
+      }
+    });
+  }
+
+  if (ui.dashboardSearchDropdown) {
+    ui.dashboardSearchDropdown.addEventListener("mousedown", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const button = target?.closest(".dashboard-search-result");
+      if (!button) {
+        return;
+      }
+      event.preventDefault();
+    });
+
+    ui.dashboardSearchDropdown.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const button = target?.closest(".dashboard-search-result");
+      if (!button) {
+        return;
+      }
+      const result = searchState.results[Number(button.dataset.index)];
+      if (result) {
+        void openDashboardSearchResult(result);
+      }
+    });
+  }
+
+  document.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest(".dashboard-search-bar")) {
+      closeSearchDropdown();
+    }
+  });
+
   ui.createWorkspaceButton.addEventListener("click", () => {
     const workspaceName = window.prompt("Workspace name");
     if (workspaceName === null) {

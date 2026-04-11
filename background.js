@@ -8,6 +8,7 @@ const OPENABLE_URL_REGEX = /^https?:\/\//i;
 const HEX_COLOR_REGEX = /^#[0-9a-fA-F]{6}$/;
 const SYNC_OPEN_TABS_TARGET_ITEM_BYTES = 7000;
 const SYNC_EXPORT_DEBOUNCE_MS = 2500;
+const SEARCH_RESULT_LIMIT = 10;
 const WORKSPACE_COLORS = Object.freeze([
   "#2563EB",
   "#7C3AED",
@@ -58,6 +59,70 @@ function normalizeText(value, fallback) {
 
 function getDashboardUrl() {
   return chrome.runtime.getURL(DASHBOARD_PATH);
+}
+
+function normalizeSearchValue(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function computeSearchScore(query, primaryText, secondaryText = "") {
+  const normalizedQuery = normalizeSearchValue(query);
+  if (!normalizedQuery) {
+    return null;
+  }
+
+  const primary = normalizeSearchValue(primaryText);
+  const secondary = normalizeSearchValue(secondaryText);
+  const searchable = [primary, secondary].filter(Boolean);
+  if (searchable.length === 0) {
+    return null;
+  }
+
+  const terms = normalizedQuery.split(" ").filter(Boolean);
+  const matchesAllTerms = terms.every((term) => searchable.some((field) => field.includes(term)));
+  if (!matchesAllTerms) {
+    return null;
+  }
+
+  let score = 0;
+  if (primary === normalizedQuery) {
+    score += 420;
+  } else if (primary.startsWith(normalizedQuery)) {
+    score += 280;
+  } else if (primary.includes(normalizedQuery)) {
+    score += 200;
+  }
+
+  if (secondary === normalizedQuery) {
+    score += 240;
+  } else if (secondary.startsWith(normalizedQuery)) {
+    score += 170;
+  } else if (secondary.includes(normalizedQuery)) {
+    score += 110;
+  }
+
+  for (const term of terms) {
+    if (primary.startsWith(term)) {
+      score += 36;
+    } else if (primary.includes(term)) {
+      score += 26;
+    }
+
+    if (secondary.startsWith(term)) {
+      score += 20;
+    } else if (secondary.includes(term)) {
+      score += 14;
+    }
+  }
+
+  const primaryIndex = primary.includes(normalizedQuery) ? primary.indexOf(normalizedQuery) : 40;
+  const secondaryIndex = secondary.includes(normalizedQuery) ? secondary.indexOf(normalizedQuery) : 40;
+  score -= Math.min(primaryIndex, secondaryIndex, 40);
+
+  return score;
 }
 
 function hashText(value) {
@@ -1712,7 +1777,9 @@ async function sleepActiveWorkspaceTabs(state, windowId, reason) {
   return { workspaceId: ensured.workspaceId, sleptCount: records.length };
 }
 
-async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId) {
+async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, options = {}) {
+  const openSleepingTabsWhenEmpty = options.openSleepingTabsWhenEmpty !== false;
+
   if (!state.workspaces[targetWorkspaceId] || Number.isFinite(state.workspaces[targetWorkspaceId].archivedAt)) {
     throw new Error("Workspace not found.");
   }
@@ -1746,7 +1813,7 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId) {
     assignUnknownToWorkspaceId: targetWorkspaceId
   });
 
-  if (visibleTargetTabs.length === 0) {
+  if (visibleTargetTabs.length === 0 && openSleepingTabsWhenEmpty) {
     const shouldOpenSleepingTabs = targetWorkspace.sessionTabs.length > 0;
     const openResult = await openTabRecords(windowId, targetWorkspace.sessionTabs, {
       openFallback: false,
@@ -2042,6 +2109,276 @@ async function getOpenTabCounts(state) {
   return counts;
 }
 
+function compareSearchResults(left, right) {
+  if (right.score !== left.score) {
+    return right.score - left.score;
+  }
+
+  const kindRank = {
+    workspace: 0,
+    "open-tab": 1,
+    "sleeping-tab": 2,
+    "history-tab": 3
+  };
+  const leftRank = kindRank[left.kind] ?? 9;
+  const rightRank = kindRank[right.kind] ?? 9;
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  if ((right.timestamp || 0) !== (left.timestamp || 0)) {
+    return (right.timestamp || 0) - (left.timestamp || 0);
+  }
+
+  return String(left.title || left.url || "").localeCompare(String(right.title || right.url || ""));
+}
+
+async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT) {
+  return queueOperation(async () => {
+    const state = await loadState();
+    const safeLimit = Math.max(1, Math.min(25, Number(limit) || SEARCH_RESULT_LIMIT));
+    const results = [];
+    const historySeen = new Set();
+    const openTabs = await chrome.tabs.query({});
+
+    for (const workspaceId of state.workspaceOrder) {
+      const workspace = state.workspaces[workspaceId];
+      if (!workspace || Number.isFinite(workspace.archivedAt)) {
+        continue;
+      }
+
+      const workspaceScore = computeSearchScore(query, workspace.name);
+      if (workspaceScore !== null) {
+        results.push({
+          kind: "workspace",
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          title: workspace.name,
+          url: "",
+          openTabCount: 0,
+          sleepingTabCount: Array.isArray(workspace.sessionTabs) ? workspace.sessionTabs.length : 0,
+          timestamp: workspace.updatedAt,
+          score: workspaceScore + 80
+        });
+      }
+
+      for (const record of Array.isArray(workspace.sessionTabs) ? workspace.sessionTabs : []) {
+        const score = computeSearchScore(query, record.title, record.url);
+        if (score === null) {
+          continue;
+        }
+
+        results.push({
+          kind: "sleeping-tab",
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          title: normalizeText(record.title, record.url),
+          url: record.url,
+          snapshotId: null,
+          timestamp: record.createdAt,
+          score
+        });
+      }
+
+      for (const snapshot of Array.isArray(workspace.history) ? workspace.history : []) {
+        for (const record of Array.isArray(snapshot.tabs) ? snapshot.tabs : []) {
+          const dedupeKey = `${workspace.id}:${record.url}`;
+          if (historySeen.has(dedupeKey)) {
+            continue;
+          }
+
+          const score = computeSearchScore(query, record.title, record.url);
+          if (score === null) {
+            continue;
+          }
+
+          historySeen.add(dedupeKey);
+          results.push({
+            kind: "history-tab",
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+            title: normalizeText(record.title, record.url),
+            url: record.url,
+            snapshotId: snapshot.id,
+            timestamp: snapshot.createdAt,
+            score: score - 10
+          });
+        }
+      }
+    }
+
+    const openTabCounts = {};
+    for (const tab of openTabs) {
+      if (!Number.isFinite(tab?.id) || tab.pinned || !isOpenableUrl(tab.url)) {
+        continue;
+      }
+
+      const workspaceId = state.tabWorkspaceById[String(tab.id)];
+      if (!workspaceId || !state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
+        continue;
+      }
+
+      openTabCounts[workspaceId] = (openTabCounts[workspaceId] || 0) + 1;
+      const workspace = state.workspaces[workspaceId];
+      const score = computeSearchScore(query, tab.title || tab.url, tab.url || "");
+      if (score === null) {
+        continue;
+      }
+
+      results.push({
+        kind: "open-tab",
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        tabId: tab.id,
+        title: normalizeText(tab.title, tab.url || "Untitled"),
+        url: tab.url || "",
+        timestamp: Number.isFinite(tab.lastAccessed) ? tab.lastAccessed : now(),
+        score: score + 20
+      });
+    }
+
+    for (const result of results) {
+      if (result.kind === "workspace") {
+        result.openTabCount = openTabCounts[result.workspaceId] || 0;
+      }
+    }
+
+    return {
+      results: results.sort(compareSearchResults).slice(0, safeLimit).map(({ score, ...result }) => result)
+    };
+  });
+}
+
+async function findWorkspaceTabInWindow(state, windowId, workspaceId, matcher) {
+  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
+    assignUnknownToWorkspaceId: workspaceId
+  });
+  return tabs.find(matcher) || null;
+}
+
+async function activateTabInWindow(windowId, tabId) {
+  await chrome.tabs.update(tabId, { active: true });
+  try {
+    await chrome.windows.update(windowId, { focused: true });
+  } catch (error) {
+    // Best effort only.
+  }
+}
+
+async function openSearchResult(state, windowId, payload) {
+  const workspace = state.workspaces[payload.workspaceId];
+  if (!workspace || Number.isFinite(workspace.archivedAt)) {
+    throw new Error("Workspace not found.");
+  }
+
+  if (payload.kind === "workspace") {
+    const switchResult = await switchWorkspaceInWindow(state, windowId, workspace.id);
+    return {
+      kind: payload.kind,
+      workspaceId: workspace.id,
+      ...switchResult
+    };
+  }
+
+  await switchWorkspaceInWindow(state, windowId, workspace.id, {
+    openSleepingTabsWhenEmpty: false
+  });
+
+  const matchingVisibleTab = await findWorkspaceTabInWindow(
+    state,
+    windowId,
+    workspace.id,
+    (tab) =>
+      (Number.isFinite(payload.tabId) && tab.id === payload.tabId) ||
+      (typeof payload.url === "string" && payload.url.length > 0 && tab.url === payload.url)
+  );
+
+  if (matchingVisibleTab && Number.isFinite(matchingVisibleTab.id)) {
+    state.activeWorkspaceByWindow[windowKey(windowId)] = workspace.id;
+    workspace.updatedAt = now();
+    workspace.lastActivatedAt = now();
+    await activateTabInWindow(windowId, matchingVisibleTab.id);
+    return {
+      kind: payload.kind,
+      workspaceId: workspace.id,
+      tabId: matchingVisibleTab.id,
+      openedCount: 0,
+      activated: true
+    };
+  }
+
+  if (payload.kind === "sleeping-tab") {
+    const sleepingIndex = workspace.sessionTabs.findIndex((tab) => tab.url === payload.url);
+    if (sleepingIndex >= 0) {
+      const [record] = workspace.sessionTabs.splice(sleepingIndex, 1);
+      const openResult = await openTabRecords(windowId, [record], {
+        openFallback: false,
+        activateFirst: true
+      });
+      setTabAssignments(state, openResult.tabIds, workspace.id);
+      workspace.updatedAt = now();
+      workspace.lastActivatedAt = now();
+      return {
+        kind: payload.kind,
+        workspaceId: workspace.id,
+        tabId: openResult.tabIds[0] || null,
+        openedCount: openResult.openedCount,
+        activated: false
+      };
+    }
+  }
+
+  if (payload.kind === "history-tab") {
+    const snapshot = workspace.history.find((item) => item.id === payload.snapshotId);
+    const record = snapshot?.tabs.find((tab) => tab.url === payload.url);
+    if (record) {
+      const openResult = await openTabRecords(windowId, [record], {
+        openFallback: false,
+        activateFirst: true
+      });
+      setTabAssignments(state, openResult.tabIds, workspace.id);
+      workspace.updatedAt = now();
+      workspace.lastActivatedAt = now();
+      return {
+        kind: payload.kind,
+        workspaceId: workspace.id,
+        tabId: openResult.tabIds[0] || null,
+        openedCount: openResult.openedCount,
+        activated: false
+      };
+    }
+  }
+
+  if (!isOpenableUrl(payload.url)) {
+    throw new Error("Result can no longer be opened.");
+  }
+
+  const openResult = await openTabRecords(
+    windowId,
+    [
+      {
+        url: payload.url,
+        title: normalizeText(payload.title, payload.url),
+        createdAt: now()
+      }
+    ],
+    {
+      openFallback: false,
+      activateFirst: true
+    }
+  );
+  setTabAssignments(state, openResult.tabIds, workspace.id);
+  workspace.updatedAt = now();
+  workspace.lastActivatedAt = now();
+  return {
+    kind: payload.kind,
+    workspaceId: workspace.id,
+    tabId: openResult.tabIds[0] || null,
+    openedCount: openResult.openedCount,
+    activated: false
+  };
+}
+
 function buildDashboardPayload(state, windowId, openTabs, openTabCounts = {}) {
   const activeWorkspaceId = state.activeWorkspaceByWindow[windowKey(windowId)] || state.workspaceOrder[0];
   const orderedWorkspaces = state.workspaceOrder.map((workspaceId) =>
@@ -2118,6 +2455,10 @@ async function handleMessage(message) {
         const state = await loadState();
         return { settings: state.settings };
       });
+    }
+
+    case "SEARCH_WORKSPACE_CONTENT": {
+      return searchWorkspaceContent(payload.query, payload.limit);
     }
 
     case "CREATE_WORKSPACE": {
@@ -2305,6 +2646,10 @@ async function handleMessage(message) {
           payload.title
         );
       });
+    }
+
+    case "OPEN_SEARCH_RESULT": {
+      return mutateState(async (state) => openSearchResult(state, requestedWindowId, payload));
     }
 
     case "MOVE_SLEEPING_TAB_TO_RESOURCES": {

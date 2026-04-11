@@ -40,6 +40,25 @@
       </aside>
 
       <main class="main">
+        <section class="dashboard-search-bar" aria-label="Workspace search">
+          <label class="dashboard-search-label" for="dashboardSearchInput">Search</label>
+          <div class="dashboard-search-shell">
+            <form id="dashboardSearchForm" class="dashboard-search-form" role="search" autocomplete="off">
+              <input
+                id="dashboardSearchInput"
+                type="search"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Search workspaces, open tabs, sleeping tabs, and history"
+                aria-autocomplete="list"
+                aria-controls="dashboardSearchDropdown"
+                aria-expanded="false"
+              />
+            </form>
+            <div id="dashboardSearchDropdown" class="dashboard-search-dropdown" hidden></div>
+          </div>
+        </section>
+
         <header class="main-header">
           <div class="workspace-header-copy">
             <h2>
