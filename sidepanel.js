@@ -8,6 +8,7 @@ const state = {
 
 const ui = {
   workspaceList: document.querySelector("#workspaceList"),
+  workspaceNameButton: document.querySelector("#workspaceNameButton"),
   workspaceName: document.querySelector("#workspaceName"),
   workspaceMeta: document.querySelector("#workspaceMeta"),
   content: document.querySelector("#content"),
@@ -159,6 +160,8 @@ function formatDisplayUrl(url, options = {}) {
 function formatSnapshotReason(reason) {
   const normalized = String(reason || "").trim().toLowerCase();
   switch (normalized) {
+    case "switch":
+      return "Workspace Switch";
     case "restore":
       return "Restored Workspace";
     case "partial-restore":
@@ -246,6 +249,108 @@ function currentWorkspace() {
   return state.dashboard?.activeWorkspace || null;
 }
 
+function workspaceOpenTabCount(workspace) {
+  return Math.max(0, Number(workspace?.openTabCount) || 0);
+}
+
+function workspaceStatusText(workspace, options = {}) {
+  const { includeResources = true, includeCurrent = false } = options;
+  const parts = [];
+  if (includeCurrent) {
+    parts.push("Currently selected");
+  }
+  parts.push(`◉ ${workspaceOpenTabCount(workspace)} open`);
+  parts.push(`☾ ${Array.isArray(workspace?.sessionTabs) ? workspace.sessionTabs.length : 0} sleeping`);
+  if (includeResources) {
+    parts.push(`${Array.isArray(workspace?.resources) ? workspace.resources.length : 0} resources`);
+  }
+  return parts.join(" • ");
+}
+
+function createWorkspaceStatChip(icon, value, label) {
+  const chip = document.createElement("span");
+  chip.className = "workspace-stat-chip";
+  chip.title = `${value} ${label}`;
+  chip.setAttribute("aria-label", `${value} ${label}`);
+
+  const iconEl = document.createElement("span");
+  iconEl.className = "workspace-stat-icon";
+  iconEl.textContent = icon;
+
+  const valueEl = document.createElement("span");
+  valueEl.className = "workspace-stat-value";
+  valueEl.textContent = String(value);
+
+  chip.append(iconEl, valueEl);
+  return chip;
+}
+
+function createWorkspaceCountCluster(workspace) {
+  const cluster = document.createElement("span");
+  cluster.className = "workspace-counts";
+  cluster.append(
+    createWorkspaceStatChip("◉", workspaceOpenTabCount(workspace), "open tabs"),
+    createWorkspaceStatChip("☾", Array.isArray(workspace?.sessionTabs) ? workspace.sessionTabs.length : 0, "sleeping tabs")
+  );
+  return cluster;
+}
+
+function createWorkspaceRenameButton(workspace, className = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `workspace-rename-button ${className}`.trim();
+  button.title = `Rename ${workspace.name}`;
+  button.setAttribute("aria-label", `Rename ${workspace.name}`);
+
+  const label = document.createElement("span");
+  label.className = "workspace-rename-label";
+  label.textContent = workspace.name;
+
+  const icon = document.createElement("span");
+  icon.className = "workspace-rename-icon";
+  icon.textContent = "✎";
+  icon.setAttribute("aria-hidden", "true");
+
+  button.append(label, icon);
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void promptRenameWorkspace(workspace);
+  });
+  return button;
+}
+
+async function promptRenameWorkspace(workspace) {
+  if (!workspace) {
+    return;
+  }
+
+  const nextName = window.prompt("Rename workspace", workspace.name);
+  if (nextName === null) {
+    return;
+  }
+
+  const trimmedName = String(nextName).trim();
+  if (!trimmedName) {
+    setToast("Workspace name cannot be empty.", "error");
+    return;
+  }
+
+  if (trimmedName === workspace.name) {
+    return;
+  }
+
+  await runAction(
+    () =>
+      send("RENAME_WORKSPACE", {
+        workspaceId: workspace.id,
+        name: trimmedName,
+        windowId: state.windowId
+      }),
+    "Workspace renamed."
+  );
+}
+
 async function send(action, payload = {}) {
   const response = await chrome.runtime.sendMessage({ action, payload });
   if (!response || !response.ok) {
@@ -331,12 +436,8 @@ function renderWorkspaceList() {
     name.className = "workspace-name";
     name.textContent = workspace.name;
 
-    const count = document.createElement("span");
-    count.className = "workspace-count";
-    count.textContent = `${workspace.sessionTabs.length} sleep`;
-
     nameWrap.append(swatchButton, swatchPicker, name);
-    label.append(nameWrap, count);
+    label.append(nameWrap, createWorkspaceCountCluster(workspace));
     button.appendChild(label);
 
     button.addEventListener("dragstart", (event) => {
@@ -464,24 +565,6 @@ function renderWorkspaceList() {
       );
     });
 
-    button.addEventListener("dblclick", (event) => {
-      event.preventDefault();
-      const nextName = window.prompt("Rename workspace", workspace.name);
-      if (nextName === null) {
-        return;
-      }
-      void runAction(
-        async () => {
-          await send("RENAME_WORKSPACE", {
-            workspaceId: workspace.id,
-            name: nextName,
-            windowId: state.windowId
-          });
-        },
-        "Workspace renamed."
-      );
-    });
-
     li.appendChild(button);
     ui.workspaceList.appendChild(li);
   }
@@ -521,14 +604,19 @@ function renderParkedWorkspaceList() {
   }
 }
 
-function makeItemCard({ title, subtitle, actions }) {
+function makeItemCard({ title, subtitle, actions, titleNode = null }) {
   const node = ui.template.content.firstElementChild.cloneNode(true);
   const titleEl = node.querySelector(".item-title");
   const subtitleEl = node.querySelector(".item-subtitle");
   const actionsEl = node.querySelector(".item-actions");
 
-  titleEl.textContent = title;
-  titleEl.title = title;
+  if (titleNode instanceof Node) {
+    titleNode.classList.add("item-title");
+    titleEl.replaceWith(titleNode);
+  } else {
+    titleEl.textContent = title;
+    titleEl.title = title;
+  }
   subtitleEl.textContent = subtitle;
   subtitleEl.title = subtitle;
 
@@ -1204,8 +1292,7 @@ function renderSettingsView() {
   } else {
     for (const managedWorkspace of activeWorkspaces) {
       const summaryParts = [
-        `${managedWorkspace.sessionTabs.length} sleeping`,
-        `${managedWorkspace.resources.length} resources`
+        workspaceStatusText(managedWorkspace, { includeResources: true, includeCurrent: false })
       ];
       if (managedWorkspace.id === state.dashboard.activeWorkspaceId) {
         summaryParts.unshift("Currently selected");
@@ -1213,6 +1300,7 @@ function renderSettingsView() {
 
       const card = makeItemCard({
         title: managedWorkspace.name,
+        titleNode: createWorkspaceRenameButton(managedWorkspace, "workspace-manager-title"),
         subtitle: summaryParts.join(" • "),
         actions: [
           {
@@ -1254,7 +1342,8 @@ function renderSettingsView() {
     for (const archivedWorkspace of archivedWorkspaces) {
       const card = makeItemCard({
         title: archivedWorkspace.name,
-        subtitle: `${archivedWorkspace.sessionTabs.length} sleeping • ${archivedWorkspace.resources.length} resources`,
+        titleNode: createWorkspaceRenameButton(archivedWorkspace, "workspace-manager-title"),
+        subtitle: workspaceStatusText(archivedWorkspace),
         actions: [
           {
             label: "Restore",
@@ -1309,7 +1398,11 @@ function render() {
   renderWorkspaceList();
   renderParkedWorkspaceList();
   ui.workspaceName.textContent = workspace.name;
-  ui.workspaceMeta.textContent = `${state.dashboard.openTabs.length} open • ${workspace.sessionTabs.length} sleeping • ${workspace.resources.length} resources`;
+  if (ui.workspaceNameButton) {
+    ui.workspaceNameButton.title = `Rename ${workspace.name}`;
+    ui.workspaceNameButton.setAttribute("aria-label", `Rename ${workspace.name}`);
+  }
+  ui.workspaceMeta.textContent = workspaceStatusText(workspace);
   applyWorkspaceIdentity(workspace);
 
   for (const button of ui.tabButtons) {
@@ -1390,6 +1483,12 @@ function wireEvents() {
     state.activeView = "settings";
     render();
   });
+
+  if (ui.workspaceNameButton) {
+    ui.workspaceNameButton.addEventListener("click", () => {
+      void promptRenameWorkspace(currentWorkspace());
+    });
+  }
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "STATE_UPDATED") {

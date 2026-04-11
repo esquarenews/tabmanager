@@ -162,10 +162,32 @@ body {
   white-space: nowrap;
 }
 
-.workspace-count {
-  color: #bfdbfe;
-  font-size: 12px;
+.workspace-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   flex: 0 0 auto;
+}
+
+.workspace-stat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(191, 219, 254, 0.12);
+  color: #bfdbfe;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.workspace-stat-icon {
+  opacity: 0.8;
+}
+
+.workspace-stat-value {
+  font-variant-numeric: tabular-nums;
 }
 
 .rail-footer {
@@ -262,6 +284,36 @@ body {
 .main-header h2 {
   margin: 0 0 4px;
   font-size: 20px;
+}
+
+.workspace-header-copy {
+  min-width: 0;
+}
+
+.workspace-title-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.workspace-title-button:hover {
+  border: 0;
+  background: transparent;
+}
+
+.workspace-title-button .workspace-rename-label {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.workspace-title-button .workspace-rename-icon {
+  font-size: 13px;
 }
 
 .meta-text {
@@ -435,6 +487,52 @@ button.danger {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.workspace-rename-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.workspace-rename-button:hover {
+  border: 0;
+  background: transparent;
+}
+
+.workspace-rename-button:focus-visible,
+.workspace-title-button:focus-visible {
+  outline: 2px solid #93c5fd;
+  outline-offset: 2px;
+}
+
+.workspace-rename-label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.workspace-rename-icon {
+  flex: 0 0 auto;
+  color: var(--muted);
+  opacity: 0.78;
+  font-size: 11px;
+}
+
+.workspace-rename-button:hover .workspace-rename-label,
+.workspace-title-button:hover .workspace-rename-label,
+.workspace-rename-button:hover .workspace-rename-icon,
+.workspace-title-button:hover .workspace-rename-icon {
+  color: var(--accent);
+  opacity: 1;
 }
 
 .item-subtitle {

@@ -30,8 +30,13 @@
 
       <main class="main">
         <header class="main-header">
-          <div>
-            <h2 id="workspaceName">Workspace</h2>
+          <div class="workspace-header-copy">
+            <h2>
+              <button id="workspaceNameButton" class="workspace-title-button" type="button" title="Rename workspace">
+                <span id="workspaceName" class="workspace-rename-label">Workspace</span>
+                <span class="workspace-rename-icon" aria-hidden="true">✎</span>
+              </button>
+            </h2>
             <p id="workspaceMeta" class="meta-text"></p>
           </div>
           <div class="header-actions">

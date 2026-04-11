@@ -785,7 +785,7 @@ async function moveOpenTabToWorkspace(state, windowId, tabId, targetWorkspaceId)
   };
 }
 
-async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId) {
+async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId, snapshotReason = null) {
   if (!state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
     return { parkedCount: 0 };
   }
@@ -819,7 +819,11 @@ async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId) {
     }
   }
 
-  workspace.parkedTabs = dedupeTabRecords(movedRecords);
+  const parkedRecords = dedupeTabRecords(movedRecords);
+  workspace.parkedTabs = parkedRecords;
+  if (snapshotReason) {
+    pushSnapshot(workspace, parkedRecords, snapshotReason, state.settings.maxSnapshotsPerWorkspace);
+  }
   clearDeferredSleepForWorkspace(state, workspaceId);
   await cleanupParkedWindow(state, workspaceId);
   return { parkedCount: movedTabIds.length, parkedWindowId };
@@ -1152,7 +1156,7 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId) {
 
   let parkedCount = 0;
   if (currentWorkspaceId && state.workspaces[currentWorkspaceId] && !Number.isFinite(state.workspaces[currentWorkspaceId].archivedAt)) {
-    const parkResult = await parkWorkspaceTabsFromWindow(state, windowId, currentWorkspaceId);
+    const parkResult = await parkWorkspaceTabsFromWindow(state, windowId, currentWorkspaceId, "switch");
     parkedCount = parkResult.parkedCount;
   }
 
@@ -1324,11 +1328,12 @@ function restoreWorkspace(state, workspaceId) {
   return { restored: true, workspaceId };
 }
 
-function serializeWorkspace(workspace) {
+function serializeWorkspace(workspace, openTabCount = 0) {
   return {
     id: workspace.id,
     name: workspace.name,
     color: workspace.color,
+    openTabCount: Math.max(0, Number(openTabCount) || 0),
     sessionTabs: workspace.sessionTabs,
     resources: workspace.resources,
     history: workspace.history,
@@ -1436,11 +1441,36 @@ async function getOpenTabsForWindow(state, windowId, workspaceId) {
   };
 }
 
-function buildDashboardPayload(state, windowId, openTabs) {
+async function getOpenTabCounts(state) {
+  const counts = {};
+  for (const workspaceId of Object.keys(state.workspaces || {})) {
+    counts[workspaceId] = 0;
+  }
+
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (!Number.isFinite(tab?.id) || tab.pinned || !isOpenableUrl(tab.url)) {
+      continue;
+    }
+
+    const workspaceId = state.tabWorkspaceById[String(tab.id)];
+    if (!workspaceId || !state.workspaces[workspaceId]) {
+      continue;
+    }
+
+    counts[workspaceId] = (counts[workspaceId] || 0) + 1;
+  }
+
+  return counts;
+}
+
+function buildDashboardPayload(state, windowId, openTabs, openTabCounts = {}) {
   const activeWorkspaceId = state.activeWorkspaceByWindow[windowKey(windowId)] || state.workspaceOrder[0];
-  const orderedWorkspaces = state.workspaceOrder.map((workspaceId) => serializeWorkspace(state.workspaces[workspaceId]));
+  const orderedWorkspaces = state.workspaceOrder.map((workspaceId) =>
+    serializeWorkspace(state.workspaces[workspaceId], openTabCounts[workspaceId] || 0)
+  );
   const archivedWorkspaces = (state.archivedWorkspaceOrder || []).map((workspaceId) =>
-    serializeWorkspace(state.workspaces[workspaceId])
+    serializeWorkspace(state.workspaces[workspaceId], openTabCounts[workspaceId] || 0)
   );
   const parkedWorkspaces = orderedWorkspaces.filter((workspace) =>
     Number.isFinite(state.parkedWindowByWorkspace?.[workspace.id])
@@ -1452,7 +1482,7 @@ function buildDashboardPayload(state, windowId, openTabs) {
     workspaces: orderedWorkspaces,
     parkedWorkspaces,
     archivedWorkspaces,
-    activeWorkspace: serializeWorkspace(state.workspaces[activeWorkspaceId]),
+    activeWorkspace: serializeWorkspace(state.workspaces[activeWorkspaceId], openTabCounts[activeWorkspaceId] || 0),
     openTabs,
     settings: state.settings
   };
@@ -1474,7 +1504,8 @@ async function getDashboardData(windowId) {
       await notifyStateUpdated();
     }
 
-    return buildDashboardPayload(finalState, windowId, openTabsResult.openTabs);
+    const openTabCounts = await getOpenTabCounts(finalState);
+    return buildDashboardPayload(finalState, windowId, openTabsResult.openTabs, openTabCounts);
   });
 }
 
