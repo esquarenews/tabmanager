@@ -4,6 +4,8 @@ const SYNC_OPEN_TABS_KEY_PREFIX = "workspace_tab_manager_sync_tabs_v1_";
 const MEMORY_ALARM = "workspace_tab_memory_sweep";
 const NEW_TAB_URL = "chrome://newtab/";
 const DASHBOARD_PATH = "dashboard.html";
+const PARKING_NOTICE_PATH = "parking-window.html";
+const PARKING_NOTICE_URL = chrome.runtime.getURL(PARKING_NOTICE_PATH);
 const OPENABLE_URL_REGEX = /^https?:\/\//i;
 const HEX_COLOR_REGEX = /^#[0-9a-fA-F]{6}$/;
 const SYNC_OPEN_TABS_TARGET_ITEM_BYTES = 7000;
@@ -59,6 +61,10 @@ function normalizeText(value, fallback) {
 
 function getDashboardUrl() {
   return chrome.runtime.getURL(DASHBOARD_PATH);
+}
+
+function isParkingNoticeUrl(url) {
+  return typeof url === "string" && url.startsWith(PARKING_NOTICE_URL);
 }
 
 function normalizeSearchValue(value) {
@@ -1061,10 +1067,34 @@ function clearDeferredSleepForWorkspace(state, workspaceId) {
   }
 }
 
-function findWorkspaceIdByParkedWindow(state, parkedWindowId) {
+function findWorkspaceIdsByParkedWindow(state, parkedWindowId) {
+  return Object.entries(state.parkedWindowByWorkspace || {})
+    .filter(([_workspaceId, candidateWindowId]) => candidateWindowId === parkedWindowId)
+    .map(([workspaceId]) => workspaceId);
+}
+
+function clearParkedWindowReferences(state, parkedWindowId) {
   for (const [workspaceId, candidateWindowId] of Object.entries(state.parkedWindowByWorkspace || {})) {
     if (candidateWindowId === parkedWindowId) {
-      return workspaceId;
+      delete state.parkedWindowByWorkspace[workspaceId];
+    }
+  }
+  delete state.activeWorkspaceByWindow[windowKey(parkedWindowId)];
+  delete state.deferredSleepByWindow[windowKey(parkedWindowId)];
+}
+
+async function getSharedParkedWindowId(state) {
+  const seenWindowIds = new Set();
+  for (const candidateWindowId of Object.values(state.parkedWindowByWorkspace || {})) {
+    if (!Number.isFinite(candidateWindowId) || seenWindowIds.has(candidateWindowId)) {
+      continue;
+    }
+    seenWindowIds.add(candidateWindowId);
+    try {
+      await chrome.windows.get(candidateWindowId);
+      return candidateWindowId;
+    } catch (error) {
+      clearParkedWindowReferences(state, candidateWindowId);
     }
   }
   return null;
@@ -1079,19 +1109,93 @@ async function getValidParkedWindowId(state, workspaceId) {
     await chrome.windows.get(parkedWindowId);
     return parkedWindowId;
   } catch (error) {
-    delete state.parkedWindowByWorkspace[workspaceId];
+    clearParkedWindowReferences(state, parkedWindowId);
     return null;
   }
 }
 
+async function ensureParkingNoticeTab(windowId) {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ windowId });
+  } catch (error) {
+    return null;
+  }
+
+  const noticeTabs = tabs.filter((tab) => Number.isFinite(tab.id) && isParkingNoticeUrl(tab.url));
+  let noticeTab = noticeTabs[0] || null;
+
+  if (!noticeTab) {
+    try {
+      noticeTab = await chrome.tabs.create({
+        windowId,
+        url: PARKING_NOTICE_URL,
+        active: true,
+        pinned: true,
+        index: 0
+      });
+    } catch (error) {
+      console.warn("Could not create parked window notice tab:", error);
+      return null;
+    }
+  }
+
+  if (!Number.isFinite(noticeTab?.id)) {
+    return null;
+  }
+
+  try {
+    await chrome.tabs.update(noticeTab.id, {
+      active: true,
+      pinned: true
+    });
+  } catch (error) {
+    // Best effort only.
+  }
+
+  try {
+    await chrome.tabs.move(noticeTab.id, { windowId, index: 0 });
+  } catch (error) {
+    // Best effort only.
+  }
+
+  const duplicateNoticeIds = noticeTabs
+    .slice(1)
+    .map((tab) => tab.id)
+    .filter((tabId) => Number.isFinite(tabId));
+  if (duplicateNoticeIds.length > 0) {
+    try {
+      await chrome.tabs.remove(duplicateNoticeIds);
+    } catch (error) {
+      // Best effort only.
+    }
+  }
+
+  return noticeTab.id;
+}
+
+async function ensureParkedWindowPresentation(windowId) {
+  await ensureParkingNoticeTab(windowId);
+  try {
+    await chrome.windows.update(windowId, {
+      focused: false,
+      state: "minimized"
+    });
+  } catch (error) {
+    // Best effort only.
+  }
+}
+
 async function ensureParkedWindow(state, workspaceId) {
-  const existingWindowId = await getValidParkedWindowId(state, workspaceId);
+  const existingWindowId = await getSharedParkedWindowId(state);
   if (Number.isFinite(existingWindowId)) {
+    state.parkedWindowByWorkspace[workspaceId] = existingWindowId;
+    await ensureParkedWindowPresentation(existingWindowId);
     return existingWindowId;
   }
 
   const created = await chrome.windows.create({
-    url: NEW_TAB_URL,
+    url: PARKING_NOTICE_URL,
     focused: false,
     state: "minimized"
   });
@@ -1099,6 +1203,7 @@ async function ensureParkedWindow(state, workspaceId) {
     throw new Error("Could not create parked workspace window.");
   }
   state.parkedWindowByWorkspace[workspaceId] = created.id;
+  await ensureParkedWindowPresentation(created.id);
   return created.id;
 }
 
@@ -1112,13 +1217,24 @@ async function cleanupParkedWindow(state, workspaceId) {
   try {
     tabs = await chrome.tabs.query({ windowId: parkedWindowId });
   } catch (error) {
-    delete state.parkedWindowByWorkspace[workspaceId];
+    clearParkedWindowReferences(state, parkedWindowId);
     return;
   }
 
   const removableIds = tabs
-    .filter((tab) => Number.isFinite(tab.id) && (tab.url === NEW_TAB_URL || !isOpenableUrl(tab.url)))
+    .filter(
+      (tab) =>
+        Number.isFinite(tab.id) &&
+        (tab.url === NEW_TAB_URL || (!isOpenableUrl(tab.url) && !isParkingNoticeUrl(tab.url)))
+    )
     .map((tab) => tab.id);
+
+  const allWorkspaceTabs = tabs.filter(
+    (tab) =>
+      Number.isFinite(tab.id) &&
+      isOpenableUrl(tab.url) &&
+      !!state.workspaces[state.tabWorkspaceById[String(tab.id)]]
+  );
 
   const openWorkspaceTabs = tabs.filter(
     (tab) =>
@@ -1129,6 +1245,10 @@ async function cleanupParkedWindow(state, workspaceId) {
 
   if (openWorkspaceTabs.length === 0) {
     delete state.parkedWindowByWorkspace[workspaceId];
+  }
+
+  if (allWorkspaceTabs.length === 0) {
+    clearParkedWindowReferences(state, parkedWindowId);
     try {
       await chrome.windows.remove(parkedWindowId);
     } catch (error) {
@@ -1144,39 +1264,58 @@ async function cleanupParkedWindow(state, workspaceId) {
       // Best effort cleanup.
     }
   }
+
+  await ensureParkedWindowPresentation(parkedWindowId);
 }
 
 async function collapseParkedWorkspaceWindow(state, workspaceId) {
   const workspace = state.workspaces[workspaceId];
   if (!workspace) {
+    const parkedWindowId = state.parkedWindowByWorkspace?.[workspaceId];
     delete state.parkedWindowByWorkspace[workspaceId];
-    return { changed: false, collapsedCount: 0 };
+    if (Number.isFinite(parkedWindowId) && findWorkspaceIdsByParkedWindow(state, parkedWindowId).length === 0) {
+      delete state.activeWorkspaceByWindow[windowKey(parkedWindowId)];
+      delete state.deferredSleepByWindow[windowKey(parkedWindowId)];
+      try {
+        await chrome.windows.remove(parkedWindowId);
+      } catch (error) {
+        // Window may already be gone.
+      }
+    }
+    return { changed: Number.isFinite(parkedWindowId), collapsedCount: 0 };
   }
 
   const parkedWindowId = await getValidParkedWindowId(state, workspaceId);
-  let records = dedupeTabRecords(Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs : []);
-  let changed = records.length > 0 || Number.isFinite(parkedWindowId);
+  const workspaceIdsInWindow = Number.isFinite(parkedWindowId)
+    ? findWorkspaceIdsByParkedWindow(state, parkedWindowId)
+    : [];
+  const recordsByWorkspaceId = new Map();
+  let changed = false;
+  let collapsedCount = 0;
 
   if (Number.isFinite(parkedWindowId)) {
+    changed = true;
     try {
       const parkedTabs = await chrome.tabs.query({ windowId: parkedWindowId });
-      const workspaceTabs = parkedTabs.filter(
-        (tab) =>
-          Number.isFinite(tab.id) &&
-          !tab.pinned &&
-          isOpenableUrl(tab.url) &&
-          state.tabWorkspaceById[String(tab.id)] === workspaceId
-      );
-      const liveRecords = dedupeTabRecords(workspaceTabs.map(tabToRecord));
-      if (liveRecords.length > 0) {
-        records = liveRecords;
+      for (const candidateWorkspaceId of workspaceIdsInWindow) {
+        const workspaceTabs = parkedTabs.filter(
+          (tab) =>
+            Number.isFinite(tab.id) &&
+            !tab.pinned &&
+            isOpenableUrl(tab.url) &&
+            state.tabWorkspaceById[String(tab.id)] === candidateWorkspaceId
+        );
+        const liveRecords = dedupeTabRecords(workspaceTabs.map(tabToRecord));
+        if (liveRecords.length > 0) {
+          recordsByWorkspaceId.set(candidateWorkspaceId, liveRecords);
+        }
+        removeTabAssignments(state, workspaceTabs.map((tab) => tab.id));
       }
-      removeTabAssignments(state, workspaceTabs.map((tab) => tab.id));
     } catch (error) {
       console.warn("Could not inspect parked window during repair:", parkedWindowId, error);
     }
 
-    delete state.parkedWindowByWorkspace[workspaceId];
+    clearParkedWindowReferences(state, parkedWindowId);
     try {
       await chrome.windows.remove(parkedWindowId);
     } catch (error) {
@@ -1184,18 +1323,40 @@ async function collapseParkedWorkspaceWindow(state, workspaceId) {
     }
   }
 
-  if (records.length > 0) {
-    appendSleepingTabs(workspace, records);
-  }
-  if (Array.isArray(workspace.parkedTabs) && workspace.parkedTabs.length > 0) {
-    workspace.parkedTabs = [];
-  }
-  clearDeferredSleepForWorkspace(state, workspaceId);
-  if (changed) {
-    workspace.updatedAt = now();
+  const processedWorkspaceIds = new Set(workspaceIdsInWindow);
+  if (!processedWorkspaceIds.has(workspaceId)) {
+    processedWorkspaceIds.add(workspaceId);
   }
 
-  return { changed, collapsedCount: records.length };
+  for (const candidateWorkspaceId of processedWorkspaceIds) {
+    const candidateWorkspace = state.workspaces[candidateWorkspaceId];
+    if (!candidateWorkspace) {
+      continue;
+    }
+
+    const fallbackRecords = dedupeTabRecords(Array.isArray(candidateWorkspace.parkedTabs) ? candidateWorkspace.parkedTabs : []);
+    const records = recordsByWorkspaceId.get(candidateWorkspaceId) || fallbackRecords;
+
+    if (records.length > 0) {
+      appendSleepingTabs(candidateWorkspace, records);
+      collapsedCount += records.length;
+      changed = true;
+    }
+
+    if (Array.isArray(candidateWorkspace.parkedTabs) && candidateWorkspace.parkedTabs.length > 0) {
+      candidateWorkspace.parkedTabs = [];
+      changed = true;
+    } else {
+      candidateWorkspace.parkedTabs = [];
+    }
+
+    clearDeferredSleepForWorkspace(state, candidateWorkspaceId);
+    if (records.length > 0 || fallbackRecords.length > 0 || workspaceIdsInWindow.includes(candidateWorkspaceId)) {
+      candidateWorkspace.updatedAt = now();
+    }
+  }
+
+  return { changed, collapsedCount };
 }
 
 async function repairParkedWorkspaceWindows() {
@@ -2908,21 +3069,35 @@ chrome.windows.onRemoved.addListener((windowId) => {
   scheduleSyncExport();
   void queueOperation(async () => {
     const state = await loadState();
-    const workspaceId = findWorkspaceIdByParkedWindow(state, windowId);
-    if (!workspaceId) {
+    const workspaceIds = findWorkspaceIdsByParkedWindow(state, windowId);
+    if (workspaceIds.length === 0) {
       return;
     }
 
     const working = structuredClone(state);
-    const workspace = working.workspaces[workspaceId];
-    if (workspace) {
-      moveParkedTabsToSleeping(working, workspace, "parked-window-closed");
+    for (const workspaceId of workspaceIds) {
+      const workspace = working.workspaces[workspaceId];
+      if (workspace) {
+        moveParkedTabsToSleeping(working, workspace, "parked-window-closed");
+      }
     }
-    delete working.parkedWindowByWorkspace[workspaceId];
-    delete working.activeWorkspaceByWindow[windowKey(windowId)];
-    delete working.deferredSleepByWindow[windowKey(windowId)];
+    clearParkedWindowReferences(working, windowId);
     await saveState(working);
     await notifyStateUpdated();
+  });
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (!Number.isFinite(windowId) || windowId === chrome.windows.WINDOW_ID_NONE) {
+    return;
+  }
+
+  void queueOperation(async () => {
+    const state = await loadState();
+    if (findWorkspaceIdsByParkedWindow(state, windowId).length === 0) {
+      return;
+    }
+    await ensureParkedWindowPresentation(windowId);
   });
 });
 
