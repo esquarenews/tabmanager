@@ -701,10 +701,17 @@ function chunkSyncedOpenTabs(records) {
 async function collectOpenTabsByWorkspace(state) {
   const openTabsByWorkspace = {};
   const tabs = await chrome.tabs.query({});
+  const parkedWindowIds = getParkedWindowIds(state);
 
   for (const tab of tabs) {
     const url = getTabUrl(tab);
-    if (!Number.isFinite(tab?.id) || !Number.isFinite(tab?.windowId) || tab.pinned || !isWorkspaceManagedUrl(url)) {
+    if (
+      !Number.isFinite(tab?.id) ||
+      !Number.isFinite(tab?.windowId) ||
+      parkedWindowIds.has(tab.windowId) ||
+      tab.pinned ||
+      !isWorkspaceManagedUrl(url)
+    ) {
       continue;
     }
 
@@ -1111,6 +1118,12 @@ function clearParkedWindowReferences(state, parkedWindowId) {
   }
   delete state.activeWorkspaceByWindow[windowKey(parkedWindowId)];
   delete state.deferredSleepByWindow[windowKey(parkedWindowId)];
+}
+
+function getParkedWindowIds(state) {
+  return new Set(
+    Object.values(state.parkedWindowByWorkspace || {}).filter((windowId) => Number.isFinite(windowId))
+  );
 }
 
 async function getSharedParkedWindowId(state) {
@@ -2310,9 +2323,7 @@ async function openOrFocusDashboard(windowId) {
 
 async function openDashboardInAllNormalWindows() {
   const state = await loadState();
-  const parkedWindowIds = new Set(
-    Object.values(state.parkedWindowByWorkspace || {}).filter((windowId) => Number.isFinite(windowId))
-  );
+  const parkedWindowIds = getParkedWindowIds(state);
   const browserWindows = await chrome.windows.getAll();
   for (const browserWindow of browserWindows) {
     if (!Number.isFinite(browserWindow?.id)) {
@@ -2365,8 +2376,15 @@ async function getOpenTabCounts(state) {
   }
 
   const tabs = await chrome.tabs.query({});
+  const parkedWindowIds = getParkedWindowIds(state);
   for (const tab of tabs) {
-    if (!Number.isFinite(tab?.id) || tab.pinned || !isWorkspaceManagedUrl(getTabUrl(tab))) {
+    if (
+      !Number.isFinite(tab?.id) ||
+      !Number.isFinite(tab?.windowId) ||
+      parkedWindowIds.has(tab.windowId) ||
+      tab.pinned ||
+      !isWorkspaceManagedUrl(getTabUrl(tab))
+    ) {
       continue;
     }
 
@@ -2480,9 +2498,16 @@ async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT) {
     }
 
     const openTabCounts = {};
+    const parkedWindowIds = getParkedWindowIds(state);
     for (const tab of openTabs) {
       const url = getTabUrl(tab);
-      if (!Number.isFinite(tab?.id) || tab.pinned || !isWorkspaceManagedUrl(url)) {
+      if (
+        !Number.isFinite(tab?.id) ||
+        !Number.isFinite(tab?.windowId) ||
+        parkedWindowIds.has(tab.windowId) ||
+        tab.pinned ||
+        !isWorkspaceManagedUrl(url)
+      ) {
         continue;
       }
 
