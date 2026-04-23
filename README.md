@@ -9,7 +9,7 @@ Chrome extension that organizes tabs by workspace in a full dashboard browser ta
   - Each workspace gets an assigned color shown as a marker next to its name.
   - Click a workspace color dot to pick and save a new color.
   - Dashboard pinned-tab icon updates to a letter badge based on the active workspace name.
-- Workspace switch: closes the previous workspace tabs from view (sleeps/saves them) and loads only the selected workspace tabs while staying on the dashboard page.
+- Workspace switch: moves previous workspace tabs into hidden workspace windows and restores only the selected workspace tabs while staying on the dashboard page.
 - Workspace organization:
   - Drag-and-drop reorder for workspaces.
 - Global settings:
@@ -19,12 +19,12 @@ Chrome extension that organizes tabs by workspace in a full dashboard browser ta
   - Move tabs between workspaces via drag-and-drop (drop a tab onto a workspace) or per-tab workspace menu.
 - Sleep behavior:
   - Manual sleep button for open tabs.
-  - Workspace switching automatically sleeps/removes prior-workspace tabs from view.
+  - Workspace switching hides prior-workspace tabs without deleting their records.
 - Memory management:
-  - Alarm-based cleanup sleeps inactive tabs (default: 120 minutes).
+  - Alarm-based cleanup discards inactive tabs in place (default: 120 minutes) to reduce memory without removing them from the tab strip.
   - Uses tab `lastAccessed`, skips pinned and active tabs.
 - History snapshots:
-  - Auto-captured on switch, sleep, and memory cleanup.
+  - Auto-captured on switch and manual sleep.
   - Per-workspace history with restore action.
 - Resources:
   - Bookmark-like list that is not auto-opened.

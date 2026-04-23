@@ -39,6 +39,19 @@ const searchState = {
 };
 
 const EXPANDED_PARKED_WORKSPACES_MIN_WIDTH = 1700;
+const OPENABLE_URL_REGEX = /^https?:\/\//i;
+
+function isResourceUrl(url) {
+  return typeof url === "string" && OPENABLE_URL_REGEX.test(url);
+}
+
+function isNewTabDisplayUrl(url) {
+  return (
+    url === "chrome://newtab/" ||
+    url === "chrome://newtab" ||
+    (typeof url === "string" && /^chrome-extension:\/\/[^/]+\/newtab\.html(?:[?#].*)?$/i.test(url))
+  );
+}
 
 function clearDropTargets() {
   for (const node of document.querySelectorAll(".drop-target")) {
@@ -165,6 +178,9 @@ function escapeHtml(value) {
 
 function formatDisplayUrl(url, options = {}) {
   const { baseOnly = false, maxLength = 56 } = options;
+  if (isNewTabDisplayUrl(url)) {
+    return "Ordinator New Tab";
+  }
   try {
     const parsed = new URL(url);
     if (baseOnly) {
@@ -887,7 +903,7 @@ function renderTabsView(workspace) {
 
       const card = makeItemCard({
         title: tab.title,
-        subtitle: formatDisplayUrl(tab.url, { baseOnly: true, maxLength: 48 }),
+        subtitle: `${tab.discarded ? "Sleeping in place · " : ""}${formatDisplayUrl(tab.url, { baseOnly: true, maxLength: 48 })}`,
         actions: []
       });
       card.draggable = true;
@@ -899,32 +915,33 @@ function renderTabsView(workspace) {
       const actionsEl = card.querySelector(".item-actions");
       const alreadyBookmarked = isBookmarkedInResources(workspace, tab.url);
 
-      const bookmarkButton = createIconActionButton({
-        icon: "🔖",
-        title: alreadyBookmarked ? "Already bookmarked in Resources" : "Bookmark in Resources",
-        active: alreadyBookmarked,
-        onClick: () => {
-          if (alreadyBookmarked) {
-            setToast("Already bookmarked in Resources.", "success");
-            return;
+      if (isResourceUrl(tab.url)) {
+        const bookmarkButton = createIconActionButton({
+          icon: "🔖",
+          title: alreadyBookmarked ? "Already bookmarked in Resources" : "Bookmark in Resources",
+          active: alreadyBookmarked,
+          onClick: () => {
+            if (alreadyBookmarked) {
+              setToast("Already bookmarked in Resources.", "success");
+              return;
+            }
+            void runAction(
+              () =>
+                send("ADD_RESOURCE", {
+                  workspaceId: workspace.id,
+                  url: tab.url,
+                  title: tab.title
+                }),
+              "Bookmarked in Resources."
+            );
           }
-          void runAction(
-            () =>
-              send("ADD_RESOURCE", {
-                workspaceId: workspace.id,
-                url: tab.url,
-                title: tab.title
-              }),
-            "Bookmarked in Resources."
-          );
-        }
-      });
-      actionsEl.appendChild(bookmarkButton);
+        });
+        actionsEl.appendChild(bookmarkButton);
+      }
 
       const closeButton = createIconActionButton({
-        icon: "\u2715",
-        title: "Close tab",
-        className: "danger",
+        icon: "☾",
+        title: "Sleep tab",
         onClick: () => {
           void runAction(
             () =>
@@ -932,7 +949,7 @@ function renderTabsView(workspace) {
                 windowId: state.windowId,
                 tabId: tab.id
               }),
-            "Tab closed."
+            "Tab moved to sleep."
           );
         }
       });
@@ -1061,27 +1078,29 @@ function renderTabsView(workspace) {
       actionsEl.appendChild(openButton);
 
       const alreadyBookmarked = isBookmarkedInResources(workspace, tab.url);
-      const bookmarkButton = createIconActionButton({
-        icon: "🔖",
-        title: alreadyBookmarked ? "Already bookmarked in Resources" : "Bookmark in Resources",
-        active: alreadyBookmarked,
-        onClick: () => {
-          if (alreadyBookmarked) {
-            setToast("Already bookmarked in Resources.", "success");
-            return;
+      if (isResourceUrl(tab.url)) {
+        const bookmarkButton = createIconActionButton({
+          icon: "🔖",
+          title: alreadyBookmarked ? "Already bookmarked in Resources" : "Bookmark in Resources",
+          active: alreadyBookmarked,
+          onClick: () => {
+            if (alreadyBookmarked) {
+              setToast("Already bookmarked in Resources.", "success");
+              return;
+            }
+            void runAction(
+              () =>
+                send("ADD_RESOURCE", {
+                  workspaceId: workspace.id,
+                  url: tab.url,
+                  title: tab.title
+                }),
+              "Bookmarked in Resources."
+            );
           }
-          void runAction(
-            () =>
-              send("ADD_RESOURCE", {
-                workspaceId: workspace.id,
-                url: tab.url,
-                title: tab.title
-              }),
-            "Bookmarked in Resources."
-          );
-        }
-      });
-      actionsEl.appendChild(bookmarkButton);
+        });
+        actionsEl.appendChild(bookmarkButton);
+      }
 
       const moveMenu = createMoveMenuControl(workspace.id, (targetWorkspaceId) => {
         void runAction(
@@ -1411,7 +1430,7 @@ function renderSettingsView() {
   memorySection.className = "section";
   memorySection.innerHTML = `
     <h3>Memory Settings</h3>
-    <p class="section-note">Tabs now stay live in hidden workspace windows until you manually sleep them. Settings are stored in chrome.storage.local on this browser profile.</p>
+    <p class="section-note">Dormant tabs are discarded in place to reduce memory without losing their tab position. Manual sleep saves tabs into the Sleeping Tabs list.</p>
   `;
 
   const form = document.createElement("form");
