@@ -701,7 +701,7 @@ function chunkSyncedOpenTabs(records) {
 async function collectOpenTabsByWorkspace(state) {
   const openTabsByWorkspace = {};
   const tabs = await chrome.tabs.query({});
-  const parkedWindowIds = getParkedWindowIds(state);
+  const parkedWindowIds = getParkedWindowIds(state, tabs);
 
   for (const tab of tabs) {
     const url = getTabUrl(tab);
@@ -1120,10 +1120,18 @@ function clearParkedWindowReferences(state, parkedWindowId) {
   delete state.deferredSleepByWindow[windowKey(parkedWindowId)];
 }
 
-function getParkedWindowIds(state) {
-  return new Set(
+function getParkedWindowIds(state, tabs = []) {
+  const parkedWindowIds = new Set(
     Object.values(state.parkedWindowByWorkspace || {}).filter((windowId) => Number.isFinite(windowId))
   );
+
+  for (const tab of tabs) {
+    if (Number.isFinite(tab?.windowId) && isParkingNoticeUrl(getTabUrl(tab))) {
+      parkedWindowIds.add(tab.windowId);
+    }
+  }
+
+  return parkedWindowIds;
 }
 
 async function getSharedParkedWindowId(state) {
@@ -2323,7 +2331,8 @@ async function openOrFocusDashboard(windowId) {
 
 async function openDashboardInAllNormalWindows() {
   const state = await loadState();
-  const parkedWindowIds = getParkedWindowIds(state);
+  const tabs = await chrome.tabs.query({});
+  const parkedWindowIds = getParkedWindowIds(state, tabs);
   const browserWindows = await chrome.windows.getAll();
   for (const browserWindow of browserWindows) {
     if (!Number.isFinite(browserWindow?.id)) {
@@ -2376,7 +2385,7 @@ async function getOpenTabCounts(state) {
   }
 
   const tabs = await chrome.tabs.query({});
-  const parkedWindowIds = getParkedWindowIds(state);
+  const parkedWindowIds = getParkedWindowIds(state, tabs);
   for (const tab of tabs) {
     if (
       !Number.isFinite(tab?.id) ||
@@ -2498,7 +2507,7 @@ async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT) {
     }
 
     const openTabCounts = {};
-    const parkedWindowIds = getParkedWindowIds(state);
+    const parkedWindowIds = getParkedWindowIds(state, openTabs);
     for (const tab of openTabs) {
       const url = getTabUrl(tab);
       if (
