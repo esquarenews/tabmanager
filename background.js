@@ -302,6 +302,7 @@ function createInitialState() {
     },
     activeWorkspaceByWindow: {},
     tabWorkspaceById: {},
+    tabRecordsById: {},
     deferredSleepByWindow: {},
     parkedWindowByWorkspace: {},
     syncedOpenTabsByWorkspace: {}
@@ -418,6 +419,21 @@ function normalizeState(state) {
     }
   }
 
+  const tabRecordsById = {};
+  if (state.tabRecordsById && typeof state.tabRecordsById === "object") {
+    for (const [tabId, record] of Object.entries(state.tabRecordsById)) {
+      if (!tabWorkspaceById[tabId] || !record || !isWorkspaceManagedUrl(record.url)) {
+        continue;
+      }
+      tabRecordsById[tabId] = {
+        url: record.url,
+        title: normalizeText(record.title, fallbackTitleForUrl(record.url)),
+        favIconUrl: typeof record.favIconUrl === "string" ? record.favIconUrl : "",
+        createdAt: Number.isFinite(record.createdAt) ? record.createdAt : now()
+      };
+    }
+  }
+
   const deferredSleepByWindow = {};
   if (state.deferredSleepByWindow && typeof state.deferredSleepByWindow === "object") {
     for (const [windowId, byWorkspace] of Object.entries(state.deferredSleepByWindow)) {
@@ -462,6 +478,7 @@ function normalizeState(state) {
     workspaces,
     activeWorkspaceByWindow,
     tabWorkspaceById,
+    tabRecordsById,
     deferredSleepByWindow,
     parkedWindowByWorkspace,
     syncedOpenTabsByWorkspace: normalizeSyncedOpenTabsByWorkspace(state.syncedOpenTabsByWorkspace)
@@ -742,20 +759,20 @@ async function assignNewTabToActiveWorkspace(tab) {
   return queueOperation(async () => {
     const state = await loadState();
     const tabIdKey = String(tab.id);
-    if (state.tabWorkspaceById[tabIdKey]) {
-      return false;
-    }
+    const existingWorkspaceId = state.tabWorkspaceById[tabIdKey];
 
-    const workspaceId = state.activeWorkspaceByWindow[windowKey(tab.windowId)];
+    const workspaceId = existingWorkspaceId || state.activeWorkspaceByWindow[windowKey(tab.windowId)];
     if (!workspaceId || !state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
       return false;
     }
 
     const working = structuredClone(state);
-    working.tabWorkspaceById[tabIdKey] = workspaceId;
-    await saveState(working);
-    await notifyStateUpdated();
-    return true;
+    const changed = setTabAssignments(working, [tab], workspaceId);
+    if (changed) {
+      await saveState(working);
+      await notifyStateUpdated();
+    }
+    return changed;
   });
 }
 
@@ -861,6 +878,7 @@ function sanitizeStateForPortableTransfer(state, options = {}) {
 
   normalized.activeWorkspaceByWindow = {};
   normalized.tabWorkspaceById = {};
+  normalized.tabRecordsById = {};
   normalized.deferredSleepByWindow = {};
   normalized.parkedWindowByWorkspace = {};
   normalized.syncedOpenTabsByWorkspace = {};
@@ -1023,16 +1041,52 @@ async function getManageableWindowTabs(windowId) {
   return tabs.filter((tab) => typeof tab.id === "number" && !tab.pinned && isWorkspaceManagedUrl(getTabUrl(tab)));
 }
 
-function setTabAssignments(state, tabIds, workspaceId) {
-  if (!state.workspaces[workspaceId]) {
-    return;
+function rememberTabRecord(state, tab) {
+  if (!Number.isFinite(tab?.id) || tab.pinned || !isWorkspaceManagedUrl(getTabUrl(tab))) {
+    return false;
   }
-  for (const tabId of tabIds || []) {
+
+  if (!state.tabRecordsById || typeof state.tabRecordsById !== "object") {
+    state.tabRecordsById = {};
+  }
+
+  const key = String(tab.id);
+  const nextRecord = tabToRecord(tab);
+  const existingRecord = state.tabRecordsById[key];
+  const changed =
+    !existingRecord ||
+    existingRecord.url !== nextRecord.url ||
+    existingRecord.title !== nextRecord.title ||
+    existingRecord.favIconUrl !== nextRecord.favIconUrl;
+
+  state.tabRecordsById[key] = {
+    ...nextRecord,
+    createdAt: Number.isFinite(existingRecord?.createdAt) ? existingRecord.createdAt : nextRecord.createdAt
+  };
+
+  return changed;
+}
+
+function setTabAssignments(state, tabsOrIds, workspaceId) {
+  if (!state.workspaces[workspaceId]) {
+    return false;
+  }
+  let changed = false;
+  for (const tabOrId of tabsOrIds || []) {
+    const tabId = Number.isFinite(tabOrId) ? tabOrId : tabOrId?.id;
     if (!Number.isFinite(tabId)) {
       continue;
     }
-    state.tabWorkspaceById[String(tabId)] = workspaceId;
+    const key = String(tabId);
+    if (state.tabWorkspaceById[key] !== workspaceId) {
+      changed = true;
+    }
+    state.tabWorkspaceById[key] = workspaceId;
+    if (tabOrId && typeof tabOrId === "object") {
+      changed = rememberTabRecord(state, tabOrId) || changed;
+    }
   }
+  return changed;
 }
 
 function removeTabIdsFromDeferredSleep(state, tabIds) {
@@ -1060,6 +1114,9 @@ function removeTabAssignments(state, tabIds) {
       continue;
     }
     delete state.tabWorkspaceById[String(tabId)];
+    if (state.tabRecordsById && typeof state.tabRecordsById === "object") {
+      delete state.tabRecordsById[String(tabId)];
+    }
   }
   removeTabIdsFromDeferredSleep(state, tabIds);
 }
@@ -1425,30 +1482,60 @@ async function collapseParkedWorkspaceWindow(state, workspaceId) {
 async function repairParkedWorkspaceWindows() {
   return queueOperation(async () => {
     const state = await loadState();
-    const workspaceIds = Object.keys(state.parkedWindowByWorkspace || {});
+    const parkedWindowEntries = Object.entries(state.parkedWindowByWorkspace || {}).filter(
+      ([workspaceId, windowId]) => state.workspaces[workspaceId] && Number.isFinite(windowId)
+    );
     const orphanedParkedTabs = Object.values(state.workspaces || {}).some(
       (workspace) => Array.isArray(workspace?.parkedTabs) && workspace.parkedTabs.length > 0
     );
 
-    if (workspaceIds.length === 0 && !orphanedParkedTabs) {
+    if (parkedWindowEntries.length === 0 && !orphanedParkedTabs) {
       return { repaired: false, collapsedCount: 0 };
     }
 
     const working = structuredClone(state);
     let changed = false;
     let collapsedCount = 0;
+    const validParkedWorkspaceIds = new Set();
+    const checkedWindowIds = new Set();
+    const validWindowIds = new Set();
+    const invalidWindowIds = new Set();
 
-    const candidateWorkspaceIds = new Set([
-      ...Object.keys(working.parkedWindowByWorkspace || {}),
-      ...Object.entries(working.workspaces || {})
-        .filter(([_workspaceId, workspace]) => Array.isArray(workspace?.parkedTabs) && workspace.parkedTabs.length > 0)
-        .map(([workspaceId]) => workspaceId)
-    ]);
+    for (const [_workspaceId, windowId] of parkedWindowEntries) {
+      if (checkedWindowIds.has(windowId)) {
+        continue;
+      }
+      checkedWindowIds.add(windowId);
+      try {
+        await chrome.windows.get(windowId);
+        validWindowIds.add(windowId);
+        await ensureParkedWindowPresentation(windowId);
+      } catch (error) {
+        invalidWindowIds.add(windowId);
+      }
+    }
 
-    for (const workspaceId of candidateWorkspaceIds) {
-      const result = await collapseParkedWorkspaceWindow(working, workspaceId);
-      changed = changed || result.changed;
-      collapsedCount += result.collapsedCount;
+    for (const [workspaceId, windowId] of parkedWindowEntries) {
+      if (validWindowIds.has(windowId)) {
+        validParkedWorkspaceIds.add(workspaceId);
+        continue;
+      }
+      if (invalidWindowIds.has(windowId)) {
+        clearParkedWindowReferences(working, windowId);
+        changed = true;
+      }
+    }
+
+    for (const [workspaceId, workspace] of Object.entries(working.workspaces || {})) {
+      if (validParkedWorkspaceIds.has(workspaceId)) {
+        continue;
+      }
+      if (!Array.isArray(workspace?.parkedTabs) || workspace.parkedTabs.length === 0) {
+        continue;
+      }
+      const movedCount = moveParkedTabsToSleeping(working, workspace, "parked-window-missing");
+      collapsedCount += movedCount;
+      changed = true;
     }
 
     if (!changed) {
@@ -1458,6 +1545,31 @@ async function repairParkedWorkspaceWindows() {
     await saveState(working);
     await notifyStateUpdated();
     return { repaired: true, collapsedCount };
+  });
+}
+
+async function hydrateOpenTabRecords() {
+  return queueOperation(async () => {
+    const state = await loadState();
+    const working = structuredClone(state);
+    const tabs = await chrome.tabs.query({});
+    let changed = false;
+
+    for (const tab of tabs) {
+      const workspaceId = working.tabWorkspaceById[String(tab.id)];
+      if (!workspaceId || !working.workspaces[workspaceId]) {
+        continue;
+      }
+      changed = setTabAssignments(working, [tab], workspaceId) || changed;
+    }
+
+    if (!changed) {
+      return { hydrated: false };
+    }
+
+    await saveState(working);
+    await notifyStateUpdated();
+    return { hydrated: true };
   });
 }
 
@@ -1637,7 +1749,7 @@ async function moveOpenTabToWorkspace(state, windowId, tabId, targetWorkspaceId)
     return { moved: false };
   }
 
-  state.tabWorkspaceById[String(tabId)] = targetWorkspaceId;
+  setTabAssignments(state, [tab], targetWorkspaceId);
   removeTabIdsFromDeferredSleep(state, [tabId]);
 
   if (state.workspaces[sourceWorkspaceId]) {
@@ -1754,8 +1866,9 @@ async function syncWindowWorkspaceVisibility(state, windowId, activeWorkspaceId)
     let assignedWorkspaceId = state.tabWorkspaceById[tabIdKey];
     if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId] || Number.isFinite(state.workspaces[assignedWorkspaceId].archivedAt)) {
       assignedWorkspaceId = activeWorkspaceId;
-      state.tabWorkspaceById[tabIdKey] = activeWorkspaceId;
-      changed = true;
+      changed = setTabAssignments(state, [tab], activeWorkspaceId) || true;
+    } else {
+      changed = rememberTabRecord(state, tab) || changed;
     }
     if (assignedWorkspaceId !== activeWorkspaceId) {
       workspaceIdsToPark.add(assignedWorkspaceId);
@@ -1783,7 +1896,7 @@ async function activateOrOpenWorkspaceTab(state, windowId, workspaceId, tabId, u
       const tab = await chrome.tabs.get(tabId);
       if (tab && !tab.pinned && isWorkspaceManagedUrl(getTabUrl(tab))) {
         const tabWindowId = Number.isFinite(tab.windowId) ? tab.windowId : windowId;
-        state.tabWorkspaceById[String(tabId)] = workspaceId;
+        setTabAssignments(state, [tab], workspaceId);
         removeTabIdsFromDeferredSleep(state, [tabId]);
         state.activeWorkspaceByWindow[windowKey(tabWindowId)] = workspaceId;
 
@@ -1818,7 +1931,7 @@ async function activateOrOpenWorkspaceTab(state, windowId, workspaceId, tabId, u
     ],
     { openFallback: false, activateFirst: true }
   );
-  setTabAssignments(state, openResult.tabIds, workspaceId);
+  setTabAssignments(state, openResult.tabs, workspaceId);
   const sleepingIndex = workspace.sessionTabs.findIndex((tab) => tab.url === url);
   if (sleepingIndex >= 0) {
     workspace.sessionTabs.splice(sleepingIndex, 1);
@@ -1849,11 +1962,12 @@ async function getWorkspaceTabsForWindow(state, windowId, workspaceId, options =
     if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId]) {
       if (assignUnknownToWorkspaceId && state.workspaces[assignUnknownToWorkspaceId]) {
         assignedWorkspaceId = assignUnknownToWorkspaceId;
-        state.tabWorkspaceById[key] = assignUnknownToWorkspaceId;
-        changed = true;
+        changed = setTabAssignments(state, [tab], assignUnknownToWorkspaceId) || true;
       } else {
         continue;
       }
+    } else {
+      changed = rememberTabRecord(state, tab) || changed;
     }
 
     if (assignedWorkspaceId === workspaceId) {
@@ -1876,6 +1990,25 @@ function tabToRecord(tab) {
 
 function appendSleepingTabs(workspace, records) {
   workspace.sessionTabs = dedupeTabRecords([...(records || []), ...(workspace.sessionTabs || [])]);
+}
+
+function removeFirstMatchingTabRecord(records, record) {
+  if (!Array.isArray(records) || !record) {
+    return records || [];
+  }
+  const index = records.findIndex(
+    (candidate) =>
+      candidate &&
+      candidate.url === record.url &&
+      normalizeText(candidate.title, fallbackTitleForUrl(candidate.url)) ===
+        normalizeText(record.title, fallbackTitleForUrl(record.url))
+  );
+  if (index < 0) {
+    return records;
+  }
+  const nextRecords = [...records];
+  nextRecords.splice(index, 1);
+  return nextRecords;
 }
 
 function pushSnapshot(workspace, records, reason, maxSnapshots) {
@@ -1910,16 +2043,18 @@ async function openTabRecords(windowId, records, options = {}) {
   const { openFallback = true, activateFirst = true } = options;
   const openableRecords = dedupeTabRecords(records || []);
   const tabIds = [];
+  const openedTabs = [];
 
   if (openableRecords.length === 0) {
     if (openFallback) {
       const created = await chrome.tabs.create({ windowId, url: NEW_TAB_URL, active: activateFirst });
       if (Number.isFinite(created.id)) {
         tabIds.push(created.id);
+        openedTabs.push({ ...created, url: getTabUrl(created) || NEW_TAB_URL, title: normalizeText(created.title, "New Tab") });
       }
-      return { openedCount: 1, tabIds };
+      return { openedCount: 1, tabIds, tabs: openedTabs };
     }
-    return { openedCount: 0, tabIds };
+    return { openedCount: 0, tabIds, tabs: openedTabs };
   }
 
   let openedCount = 0;
@@ -1933,6 +2068,12 @@ async function openTabRecords(windowId, records, options = {}) {
       });
       if (Number.isFinite(created.id)) {
         tabIds.push(created.id);
+        openedTabs.push({
+          ...created,
+          url: getTabUrl(created) || record.url,
+          title: normalizeText(created.title, normalizeText(record.title, fallbackTitleForUrl(record.url))),
+          favIconUrl: typeof created.favIconUrl === "string" ? created.favIconUrl : record.favIconUrl || ""
+        });
       }
       openedCount += 1;
       first = false;
@@ -1945,11 +2086,12 @@ async function openTabRecords(windowId, records, options = {}) {
     const created = await chrome.tabs.create({ windowId, url: NEW_TAB_URL, active: activateFirst });
     if (Number.isFinite(created.id)) {
       tabIds.push(created.id);
+      openedTabs.push({ ...created, url: getTabUrl(created) || NEW_TAB_URL, title: normalizeText(created.title, "New Tab") });
     }
-    return { openedCount: 1, tabIds };
+    return { openedCount: 1, tabIds, tabs: openedTabs };
   }
 
-  return { openedCount, tabIds };
+  return { openedCount, tabIds, tabs: openedTabs };
 }
 
 async function closeTabsKeepingWindow(windowId, tabIds, state = null) {
@@ -2006,7 +2148,7 @@ async function sleepOpenTabsById(state, windowId, tabIds, reason) {
       workspaceId = ensured.workspaceId;
     }
 
-    state.tabWorkspaceById[tabIdKey] = workspaceId;
+    setTabAssignments(state, [tab], workspaceId);
     if (!tabsByWorkspace.has(workspaceId)) {
       tabsByWorkspace.set(workspaceId, []);
     }
@@ -2108,7 +2250,7 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, optio
       activateFirst: false
     });
     openedCount += openResult.openedCount;
-    setTabAssignments(state, openResult.tabIds, targetWorkspaceId);
+    setTabAssignments(state, openResult.tabs, targetWorkspaceId);
     if (shouldOpenSleepingTabs && openResult.openedCount > 0) {
       targetWorkspace.sessionTabs = [];
     }
@@ -2622,7 +2764,7 @@ async function openSearchResult(state, windowId, payload) {
         openFallback: false,
         activateFirst: true
       });
-      setTabAssignments(state, openResult.tabIds, workspace.id);
+      setTabAssignments(state, openResult.tabs, workspace.id);
       workspace.updatedAt = now();
       workspace.lastActivatedAt = now();
       return {
@@ -2643,7 +2785,7 @@ async function openSearchResult(state, windowId, payload) {
         openFallback: false,
         activateFirst: true
       });
-      setTabAssignments(state, openResult.tabIds, workspace.id);
+      setTabAssignments(state, openResult.tabs, workspace.id);
       workspace.updatedAt = now();
       workspace.lastActivatedAt = now();
       return {
@@ -2674,7 +2816,7 @@ async function openSearchResult(state, windowId, payload) {
       activateFirst: true
     }
   );
-  setTabAssignments(state, openResult.tabIds, workspace.id);
+  setTabAssignments(state, openResult.tabs, workspace.id);
   workspace.updatedAt = now();
   workspace.lastActivatedAt = now();
   return {
@@ -2771,8 +2913,10 @@ async function runMemorySweep() {
           continue;
         }
         workspaceId = windowWorkspaceId;
-        state.tabWorkspaceById[tabIdKey] = workspaceId;
+        setTabAssignments(state, [tab], workspaceId);
         assignedCount += 1;
+      } else {
+        rememberTabRecord(state, tab);
       }
 
       try {
@@ -2893,7 +3037,7 @@ async function handleMessage(message) {
         const ensured = ensureWorkspaceForWindow(state, requestedWindowId);
         const workspace = state.workspaces[ensured.workspaceId];
         const openResult = await openTabRecords(requestedWindowId, workspace.sessionTabs, { openFallback: false });
-        setTabAssignments(state, openResult.tabIds, workspace.id);
+        setTabAssignments(state, openResult.tabs, workspace.id);
         if (openResult.openedCount > 0) {
           workspace.sessionTabs = [];
           workspace.updatedAt = now();
@@ -2918,7 +3062,7 @@ async function handleMessage(message) {
         }
         const [tab] = workspace.sessionTabs.splice(index, 1);
         const openResult = await openTabRecords(requestedWindowId, [tab], { openFallback: false });
-        setTabAssignments(state, openResult.tabIds, workspace.id);
+        setTabAssignments(state, openResult.tabs, workspace.id);
         workspace.updatedAt = now();
         return { workspaceId: workspace.id, openedCount: openResult.openedCount };
       });
@@ -3056,7 +3200,7 @@ async function handleMessage(message) {
           throw new Error("Resource not found.");
         }
         const openResult = await openTabRecords(requestedWindowId, [resource], { openFallback: false });
-        setTabAssignments(state, openResult.tabIds, workspace.id);
+        setTabAssignments(state, openResult.tabs, workspace.id);
         return { workspaceId: workspace.id, openedCount: openResult.openedCount };
       });
     }
@@ -3084,7 +3228,7 @@ async function handleMessage(message) {
         }
 
         const openResult = await openTabRecords(requestedWindowId, snapshot.tabs, { openFallback: true });
-        setTabAssignments(state, openResult.tabIds, workspace.id);
+        setTabAssignments(state, openResult.tabs, workspace.id);
         await saveState(state);
         await closeTabsKeepingWindow(
           requestedWindowId,
@@ -3116,7 +3260,7 @@ async function handleMessage(message) {
         await switchWorkspaceInWindow(state, requestedWindowId, workspace.id);
 
         const openResult = await openTabRecords(requestedWindowId, [record], { openFallback: false });
-        setTabAssignments(state, openResult.tabIds, workspace.id);
+        setTabAssignments(state, openResult.tabs, workspace.id);
         workspace.updatedAt = now();
         workspace.lastActivatedAt = now();
         return { workspaceId: workspace.id, openedCount: openResult.openedCount };
@@ -3178,6 +3322,7 @@ async function handleMessage(message) {
 chrome.runtime.onInstalled.addListener((details) => {
   void (async () => {
     await loadState();
+    await hydrateOpenTabRecords();
     await repairParkedWorkspaceWindows();
     await ensureAlarm();
     scheduleSyncExport(1000);
@@ -3195,6 +3340,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 chrome.runtime.onStartup.addListener(() => {
   void (async () => {
     await loadState();
+    await hydrateOpenTabRecords();
     await repairParkedWorkspaceWindows();
     await ensureAlarm();
     scheduleSyncExport(1000);
@@ -3214,6 +3360,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void queueOperation(async () => {
     const state = await loadState();
     const key = String(tabId);
+    const workspaceId = state.tabWorkspaceById[key];
+    const record = state.tabRecordsById?.[key] || null;
     let hasDeferredReference = false;
 
     for (const byWorkspace of Object.values(state.deferredSleepByWindow)) {
@@ -3228,11 +3376,21 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       }
     }
 
-    if (!state.tabWorkspaceById[key] && !hasDeferredReference) {
+    if (!workspaceId && !hasDeferredReference) {
       return;
     }
 
     const working = structuredClone(state);
+    const workspace = working.workspaces[workspaceId];
+    if (
+      workspace &&
+      record &&
+      isWorkspaceManagedUrl(record.url)
+    ) {
+      appendSleepingTabs(workspace, [record]);
+      workspace.parkedTabs = removeFirstMatchingTabRecord(workspace.parkedTabs, record);
+      workspace.updatedAt = now();
+    }
     removeTabAssignments(working, [tabId]);
     await saveState(working);
     await notifyStateUpdated();
