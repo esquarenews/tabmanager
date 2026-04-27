@@ -1430,7 +1430,7 @@ function renderSettingsView() {
   memorySection.className = "section";
   memorySection.innerHTML = `
     <h3>Memory Settings</h3>
-    <p class="section-note">Dormant tabs are discarded in place to reduce memory without losing their tab position. Manual sleep saves tabs into the Sleeping Tabs list.</p>
+    <p class="section-note">Dormant and manually slept tabs are discarded in place to reduce memory without closing tabs or losing their tab-strip position.</p>
   `;
 
   const form = document.createElement("form");

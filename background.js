@@ -2,6 +2,9 @@ const STORAGE_KEY = "workspace_tab_manager_state";
 const SYNC_META_KEY = "workspace_tab_manager_sync_meta_v1";
 const SYNC_OPEN_TABS_KEY_PREFIX = "workspace_tab_manager_sync_tabs_v1_";
 const MEMORY_ALARM = "workspace_tab_memory_sweep";
+const STARTUP_BOOTSTRAP_KEY = "workspace_tab_manager_startup_bootstrap_v1";
+const STARTUP_DASHBOARD_ALARM = "workspace_tab_startup_dashboard_retry";
+const EXTENSION_HEARTBEAT_KEY = "workspace_tab_manager_heartbeat_v1";
 const NEW_TAB_URL = "chrome://newtab/";
 const NEW_TAB_PAGE_PATH = "newtab.html";
 const NEW_TAB_PAGE_URL = chrome.runtime.getURL(NEW_TAB_PAGE_PATH);
@@ -13,6 +16,11 @@ const HEX_COLOR_REGEX = /^#[0-9a-fA-F]{6}$/;
 const SYNC_OPEN_TABS_TARGET_ITEM_BYTES = 7000;
 const SYNC_EXPORT_DEBOUNCE_MS = 2500;
 const SEARCH_RESULT_LIMIT = 10;
+const STARTUP_TAB_ASSIGNMENT_SUPPRESSION_MS = 2 * 60 * 1000;
+const STARTUP_DASHBOARD_RETRY_WINDOW_MS = 5 * 60 * 1000;
+const STARTUP_DASHBOARD_RETRY_ALARM_MINUTES = 1;
+const STARTUP_DASHBOARD_FAST_RETRY_DELAYS_MS = [1000, 4000, 10000, 30000];
+const STALE_HEARTBEAT_SUPPRESSION_MS = 10 * 60 * 1000;
 const WORKSPACE_COLORS = Object.freeze([
   "#2563EB",
   "#7C3AED",
@@ -36,6 +44,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 let stateCache = null;
 let operationQueue = Promise.resolve();
 let syncExportTimer = null;
+let startupDashboardRetryTimers = [];
 
 function now() {
   return Date.now();
@@ -750,9 +759,13 @@ async function collectOpenTabsByWorkspace(state) {
   return normalizeSyncedOpenTabsByWorkspace(openTabsByWorkspace);
 }
 
-async function assignNewTabToActiveWorkspace(tab) {
+async function assignNewTabToActiveWorkspace(tab, options = {}) {
+  const { allowNewAssignment = false } = options;
   const url = getTabUrl(tab);
   if (!Number.isFinite(tab?.id) || !Number.isFinite(tab?.windowId) || tab.pinned || !isWorkspaceManagedUrl(url)) {
+    return false;
+  }
+  if (await isStartupTabAssignmentSuppressed(tab)) {
     return false;
   }
 
@@ -760,6 +773,9 @@ async function assignNewTabToActiveWorkspace(tab) {
     const state = await loadState();
     const tabIdKey = String(tab.id);
     const existingWorkspaceId = state.tabWorkspaceById[tabIdKey];
+    if (!existingWorkspaceId && !allowNewAssignment) {
+      return false;
+    }
 
     const workspaceId = existingWorkspaceId || state.activeWorkspaceByWindow[windowKey(tab.windowId)];
     if (!workspaceId || !state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
@@ -1012,6 +1028,220 @@ async function ensureAlarm() {
   const existingAlarm = await chrome.alarms.get(MEMORY_ALARM);
   if (!existingAlarm) {
     await chrome.alarms.create(MEMORY_ALARM, { periodInMinutes: 5 });
+  }
+}
+
+async function readStartupBootstrapState() {
+  const stored = await chrome.storage.local.get(STARTUP_BOOTSTRAP_KEY);
+  const value = stored[STARTUP_BOOTSTRAP_KEY];
+  return value && typeof value === "object" ? value : {};
+}
+
+async function writeStartupBootstrapState(patch) {
+  const current = await readStartupBootstrapState();
+  const next = {
+    ...current,
+    ...patch,
+    updatedAt: now()
+  };
+  await chrome.storage.local.set({ [STARTUP_BOOTSTRAP_KEY]: next });
+  return next;
+}
+
+async function refreshExtensionHeartbeat(reason = "activity") {
+  await chrome.storage.local.set({
+    [EXTENSION_HEARTBEAT_KEY]: {
+      reason,
+      updatedAt: now()
+    }
+  });
+}
+
+async function hasStaleExtensionHeartbeat() {
+  const stored = await chrome.storage.local.get(EXTENSION_HEARTBEAT_KEY);
+  const heartbeat = stored[EXTENSION_HEARTBEAT_KEY];
+  const updatedAt = Number(heartbeat?.updatedAt);
+  return !Number.isFinite(updatedAt) || now() - updatedAt > STALE_HEARTBEAT_SUPPRESSION_MS;
+}
+
+function isLikelySessionRestoreTab(tab) {
+  const url = getTabUrl(tab);
+  return (
+    Number.isFinite(tab?.id) &&
+    Number.isFinite(tab?.windowId) &&
+    !tab.pinned &&
+    !Number.isFinite(tab.openerTabId) &&
+    isWorkspaceManagedUrl(url) &&
+    !isNewTabUrl(url)
+  );
+}
+
+async function isStartupTabAssignmentSuppressed(tab) {
+  if (!isLikelySessionRestoreTab(tab)) {
+    return false;
+  }
+  const bootstrapState = await readStartupBootstrapState();
+  return Number(bootstrapState.suppressAssignmentUntil) > now();
+}
+
+async function extendStartupTabAssignmentSuppression(reason) {
+  const current = await readStartupBootstrapState();
+  const timestamp = now();
+  const suppressAssignmentUntil = Math.max(
+    Number(current.suppressAssignmentUntil) || 0,
+    timestamp + STARTUP_TAB_ASSIGNMENT_SUPPRESSION_MS
+  );
+  await writeStartupBootstrapState({
+    reason,
+    suppressAssignmentUntil
+  });
+  return suppressAssignmentUntil;
+}
+
+async function shouldSuppressCreatedTabAssignment(tab) {
+  if (!isLikelySessionRestoreTab(tab)) {
+    return false;
+  }
+
+  if (await isStartupTabAssignmentSuppressed(tab)) {
+    return true;
+  }
+
+  if (await hasStaleExtensionHeartbeat()) {
+    await extendStartupTabAssignmentSuppression("stale-heartbeat");
+    await startStartupDashboardRetries("stale-heartbeat", { suppressTabAssignment: true });
+    return true;
+  }
+
+  return false;
+}
+
+function clearStartupDashboardFastRetries() {
+  for (const timerId of startupDashboardRetryTimers) {
+    clearTimeout(timerId);
+  }
+  startupDashboardRetryTimers = [];
+}
+
+function scheduleStartupDashboardFastRetries(reason) {
+  clearStartupDashboardFastRetries();
+  startupDashboardRetryTimers = STARTUP_DASHBOARD_FAST_RETRY_DELAYS_MS.map((delay) =>
+    setTimeout(() => {
+      void runStartupDashboardRetry(`${reason}:fast-retry`).catch((error) =>
+        console.warn("Could not retry startup dashboard open:", error)
+      );
+    }, delay)
+  );
+}
+
+async function startStartupDashboardRetries(reason, options = {}) {
+  const { suppressTabAssignment = false } = options;
+  const timestamp = now();
+  const patch = {
+    reason,
+    dashboardRetryUntil: timestamp + STARTUP_DASHBOARD_RETRY_WINDOW_MS,
+    dashboardAttemptCount: 0
+  };
+  if (suppressTabAssignment) {
+    patch.suppressAssignmentUntil = timestamp + STARTUP_TAB_ASSIGNMENT_SUPPRESSION_MS;
+  }
+
+  await writeStartupBootstrapState(patch);
+  scheduleStartupDashboardFastRetries(reason);
+  try {
+    await chrome.alarms.create(STARTUP_DASHBOARD_ALARM, {
+      delayInMinutes: STARTUP_DASHBOARD_RETRY_ALARM_MINUTES,
+      periodInMinutes: STARTUP_DASHBOARD_RETRY_ALARM_MINUTES
+    });
+  } catch (error) {
+    console.warn("Could not schedule startup dashboard retry alarm:", error);
+  }
+}
+
+async function stopStartupDashboardRetries(patch = {}) {
+  clearStartupDashboardFastRetries();
+  await chrome.alarms.clear(STARTUP_DASHBOARD_ALARM);
+  await writeStartupBootstrapState({
+    dashboardRetryUntil: 0,
+    ...patch
+  });
+}
+
+async function runStartupDashboardRetry(reason) {
+  const bootstrapState = await readStartupBootstrapState();
+  const retryUntil = Number(bootstrapState.dashboardRetryUntil) || 0;
+  if (retryUntil <= 0) {
+    return { attemptedWindowCount: 0, dashboardWindowCount: 0, inactive: true };
+  }
+  if (retryUntil > 0 && retryUntil < now()) {
+    await stopStartupDashboardRetries({
+      reason,
+      lastDashboardResult: "expired"
+    });
+    return { attemptedWindowCount: 0, dashboardWindowCount: 0, expired: true };
+  }
+
+  if (Number(bootstrapState.suppressAssignmentUntil) > now()) {
+    try {
+      await hydrateOpenTabRecords({ trustExistingTabIds: false, includeSleepingTabs: true });
+    } catch (error) {
+      console.warn("Could not rehydrate restored tabs during startup retry:", error);
+    }
+  }
+
+  const result = await openDashboardInAllNormalWindows();
+  const dashboardAttemptCount = (Number(bootstrapState.dashboardAttemptCount) || 0) + 1;
+  await writeStartupBootstrapState({
+    reason,
+    dashboardAttemptCount,
+    lastDashboardAttemptAt: now(),
+    lastDashboardResult: result
+  });
+
+  if (result.dashboardWindowCount > 0) {
+    await stopStartupDashboardRetries({
+      reason,
+      dashboardAttemptCount,
+      lastDashboardResult: result
+    });
+  }
+
+  return result;
+}
+
+async function bootstrapExtensionRuntime(reason, options = {}) {
+  const { openDashboard = true, suppressTabAssignment = false } = options;
+  if (openDashboard) {
+    await startStartupDashboardRetries(reason, { suppressTabAssignment });
+  } else if (suppressTabAssignment) {
+    await extendStartupTabAssignmentSuppression(reason);
+  }
+
+  try {
+    await loadState();
+    await hydrateOpenTabRecords({
+      trustExistingTabIds: !suppressTabAssignment,
+      includeSleepingTabs: suppressTabAssignment
+    });
+    await repairParkedWorkspaceWindows();
+    await ensureAlarm();
+    scheduleSyncExport(1000);
+  } catch (error) {
+    console.warn("Could not finish extension startup maintenance:", error);
+  }
+
+  if (openDashboard) {
+    try {
+      await runStartupDashboardRetry(reason);
+    } catch (error) {
+      console.warn("Could not open dashboard during startup bootstrap:", error);
+    }
+  }
+
+  try {
+    await refreshExtensionHeartbeat(reason);
+  } catch (error) {
+    // Best effort only.
   }
 }
 
@@ -1369,20 +1599,11 @@ async function cleanupParkedWindow(state, workspaceId) {
 
   if (allWorkspaceTabs.length === 0) {
     clearParkedWindowReferences(state, parkedWindowId);
-    try {
-      await chrome.windows.remove(parkedWindowId);
-    } catch (error) {
-      // Window may already be gone.
-    }
     return;
   }
 
   if (removableIds.length > 0) {
-    try {
-      await chrome.tabs.remove(removableIds);
-    } catch (error) {
-      // Best effort cleanup.
-    }
+    console.warn("Leaving unassigned tabs in parked window instead of removing them:", removableIds);
   }
 
   await ensureParkedWindowPresentation(parkedWindowId);
@@ -1396,11 +1617,6 @@ async function collapseParkedWorkspaceWindow(state, workspaceId) {
     if (Number.isFinite(parkedWindowId) && findWorkspaceIdsByParkedWindow(state, parkedWindowId).length === 0) {
       delete state.activeWorkspaceByWindow[windowKey(parkedWindowId)];
       delete state.deferredSleepByWindow[windowKey(parkedWindowId)];
-      try {
-        await chrome.windows.remove(parkedWindowId);
-      } catch (error) {
-        // Window may already be gone.
-      }
     }
     return { changed: Number.isFinite(parkedWindowId), collapsedCount: 0 };
   }
@@ -1436,11 +1652,6 @@ async function collapseParkedWorkspaceWindow(state, workspaceId) {
     }
 
     clearParkedWindowReferences(state, parkedWindowId);
-    try {
-      await chrome.windows.remove(parkedWindowId);
-    } catch (error) {
-      // Window may already be gone.
-    }
   }
 
   const processedWorkspaceIds = new Set(workspaceIdsInWindow);
@@ -1548,19 +1759,129 @@ async function repairParkedWorkspaceWindows() {
   });
 }
 
-async function hydrateOpenTabRecords() {
+function takeStoredTabCandidate(candidatesByUrl, tab) {
+  const url = getTabUrl(tab);
+  const candidates = candidatesByUrl.get(url);
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return null;
+  }
+
+  const title = normalizeText(tab.title, fallbackTitleForUrl(url));
+  let candidateIndex = candidates.findIndex(
+    (candidate) => normalizeText(candidate.record?.title, fallbackTitleForUrl(candidate.record?.url)) === title
+  );
+  if (candidateIndex < 0) {
+    candidateIndex = 0;
+  }
+
+  const [candidate] = candidates.splice(candidateIndex, 1);
+  if (candidates.length === 0) {
+    candidatesByUrl.delete(url);
+  }
+  return candidate || null;
+}
+
+function addStoredTabCandidate(candidatesByUrl, workspaceId, record, source) {
+  const tabs = dedupeTabRecords([record]);
+  if (tabs.length === 0) {
+    return;
+  }
+  const [safeRecord] = tabs;
+  if (!candidatesByUrl.has(safeRecord.url)) {
+    candidatesByUrl.set(safeRecord.url, []);
+  }
+  candidatesByUrl.get(safeRecord.url).push({ workspaceId, record: safeRecord, source });
+}
+
+async function hydrateOpenTabRecords(options = {}) {
+  const { trustExistingTabIds = true, includeSleepingTabs = false } = options;
   return queueOperation(async () => {
     const state = await loadState();
     const working = structuredClone(state);
     const tabs = await chrome.tabs.query({});
+    const previousAssignments = { ...(working.tabWorkspaceById || {}) };
+    const previousRecords = { ...(working.tabRecordsById || {}) };
+    const candidatesByUrl = new Map();
     let changed = false;
 
-    for (const tab of tabs) {
-      const workspaceId = working.tabWorkspaceById[String(tab.id)];
-      if (!workspaceId || !working.workspaces[workspaceId]) {
+    for (const [tabId, workspaceId] of Object.entries(previousAssignments)) {
+      const workspace = working.workspaces[workspaceId];
+      const record = previousRecords[tabId];
+      if (!workspace || Number.isFinite(workspace.archivedAt) || !record) {
         continue;
       }
+      addStoredTabCandidate(candidatesByUrl, workspaceId, record, "record");
+    }
+
+    if (includeSleepingTabs) {
+      for (const [workspaceId, workspace] of Object.entries(working.workspaces || {})) {
+        if (!workspace || Number.isFinite(workspace.archivedAt)) {
+          continue;
+        }
+        for (const record of workspace.sessionTabs || []) {
+          addStoredTabCandidate(candidatesByUrl, workspaceId, record, "sleeping");
+        }
+      }
+    }
+
+    if (!trustExistingTabIds) {
+      if (
+        Object.keys(working.activeWorkspaceByWindow || {}).length > 0 ||
+        Object.keys(working.deferredSleepByWindow || {}).length > 0 ||
+        Object.keys(working.tabWorkspaceById || {}).length > 0 ||
+        Object.keys(working.tabRecordsById || {}).length > 0
+      ) {
+        changed = true;
+      }
+      working.activeWorkspaceByWindow = {};
+      working.deferredSleepByWindow = {};
+      working.tabWorkspaceById = {};
+      working.tabRecordsById = {};
+    }
+
+    for (const tab of tabs) {
+      if (!Number.isFinite(tab?.id) || tab.pinned || !isWorkspaceManagedUrl(getTabUrl(tab))) {
+        continue;
+      }
+
+      let workspaceId = trustExistingTabIds ? previousAssignments[String(tab.id)] : null;
+      let matchedCandidate = null;
+      if (!workspaceId || !working.workspaces[workspaceId]) {
+        matchedCandidate = takeStoredTabCandidate(candidatesByUrl, tab);
+        workspaceId = matchedCandidate?.workspaceId || null;
+      } else {
+        matchedCandidate = takeStoredTabCandidate(candidatesByUrl, tab);
+      }
+
+      const workspace = working.workspaces[workspaceId];
+      if (!workspace || Number.isFinite(workspace.archivedAt)) {
+        continue;
+      }
+
+      const beforeSleepingCount = Array.isArray(workspace.sessionTabs) ? workspace.sessionTabs.length : 0;
+      workspace.sessionTabs = removeFirstMatchingTabRecord(workspace.sessionTabs, matchedCandidate?.record || tabToRecord(tab));
+      if (workspace.sessionTabs.length !== beforeSleepingCount) {
+        workspace.updatedAt = now();
+        changed = true;
+      }
       changed = setTabAssignments(working, [tab], workspaceId) || changed;
+    }
+
+    if (!trustExistingTabIds) {
+      for (const candidates of candidatesByUrl.values()) {
+        for (const candidate of candidates) {
+          if (candidate.source !== "record") {
+            continue;
+          }
+          const workspace = working.workspaces[candidate.workspaceId];
+          if (!workspace || Number.isFinite(workspace.archivedAt)) {
+            continue;
+          }
+          appendSleepingTabs(workspace, [candidate.record]);
+          workspace.updatedAt = now();
+          changed = true;
+        }
+      }
     }
 
     if (!changed) {
@@ -1650,9 +1971,7 @@ function reorderSleepingTabs(workspace, requestedUrls) {
 }
 
 async function reorderOpenTabsInWindow(state, windowId, workspaceId, requestedTabOrder) {
-  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
-    assignUnknownToWorkspaceId: workspaceId
-  });
+  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId);
 
   if (tabs.length < 2) {
     return { reordered: false, tabCount: tabs.length };
@@ -1769,42 +2088,25 @@ async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId, snapsho
   }
 
   const workspace = state.workspaces[workspaceId];
-  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
-    assignUnknownToWorkspaceId: workspaceId
-  });
+  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId);
   if (tabs.length === 0) {
-    workspace.parkedTabs = [];
     clearDeferredSleepForWorkspace(state, workspaceId);
-    await cleanupParkedWindow(state, workspaceId);
     return { parkedCount: 0 };
   }
 
-  const parkedWindowId = await ensureParkedWindow(state, workspaceId);
   const orderedTabs = [...tabs].sort((a, b) => a.index - b.index);
-  const movedTabIds = [];
-  const movedRecords = [];
+  const records = dedupeTabRecords(orderedTabs.map(tabToRecord));
 
   for (const tab of orderedTabs) {
-    if (!Number.isFinite(tab.id)) {
-      continue;
-    }
-    try {
-      await chrome.tabs.move(tab.id, { windowId: parkedWindowId, index: -1 });
-      movedTabIds.push(tab.id);
-      movedRecords.push(tabToRecord(tab));
-    } catch (error) {
-      console.warn("Failed to park workspace tab:", tab.id, error);
-    }
+    rememberTabRecord(state, tab);
   }
 
-  const parkedRecords = dedupeTabRecords(movedRecords);
-  workspace.parkedTabs = parkedRecords;
   if (snapshotReason) {
-    pushSnapshot(workspace, parkedRecords, snapshotReason, state.settings.maxSnapshotsPerWorkspace);
+    pushSnapshot(workspace, records, snapshotReason, state.settings.maxSnapshotsPerWorkspace);
   }
+  workspace.updatedAt = now();
   clearDeferredSleepForWorkspace(state, workspaceId);
-  await cleanupParkedWindow(state, workspaceId);
-  return { parkedCount: movedTabIds.length, parkedWindowId };
+  return { parkedCount: 0 };
 }
 
 async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) {
@@ -1865,11 +2167,9 @@ async function syncWindowWorkspaceVisibility(state, windowId, activeWorkspaceId)
     const tabIdKey = String(tab.id);
     let assignedWorkspaceId = state.tabWorkspaceById[tabIdKey];
     if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId] || Number.isFinite(state.workspaces[assignedWorkspaceId].archivedAt)) {
-      assignedWorkspaceId = activeWorkspaceId;
-      changed = setTabAssignments(state, [tab], activeWorkspaceId) || true;
-    } else {
-      changed = rememberTabRecord(state, tab) || changed;
+      continue;
     }
+    changed = rememberTabRecord(state, tab) || changed;
     if (assignedWorkspaceId !== activeWorkspaceId) {
       workspaceIdsToPark.add(assignedWorkspaceId);
     }
@@ -1946,8 +2246,7 @@ async function activateOrOpenWorkspaceTab(state, windowId, workspaceId, tabId, u
   };
 }
 
-async function getWorkspaceTabsForWindow(state, windowId, workspaceId, options = {}) {
-  const { assignUnknownToWorkspaceId = null } = options;
+async function getWorkspaceTabsForWindow(state, windowId, workspaceId) {
   const tabs = await getManageableWindowTabs(windowId);
   const output = [];
   let changed = false;
@@ -1959,16 +2258,10 @@ async function getWorkspaceTabsForWindow(state, windowId, workspaceId, options =
 
     const key = String(tab.id);
     let assignedWorkspaceId = state.tabWorkspaceById[key];
-    if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId]) {
-      if (assignUnknownToWorkspaceId && state.workspaces[assignUnknownToWorkspaceId]) {
-        assignedWorkspaceId = assignUnknownToWorkspaceId;
-        changed = setTabAssignments(state, [tab], assignUnknownToWorkspaceId) || true;
-      } else {
-        continue;
-      }
-    } else {
-      changed = rememberTabRecord(state, tab) || changed;
+    if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId] || Number.isFinite(state.workspaces[assignedWorkspaceId].archivedAt)) {
+      continue;
     }
+    changed = rememberTabRecord(state, tab) || changed;
 
     if (assignedWorkspaceId === workspaceId) {
       output.push(tab);
@@ -2094,30 +2387,23 @@ async function openTabRecords(windowId, records, options = {}) {
   return { openedCount, tabIds, tabs: openedTabs };
 }
 
-async function closeTabsKeepingWindow(windowId, tabIds, state = null) {
+async function discardTabsInPlace(tabIds) {
   const uniqueTabIds = [...new Set((tabIds || []).filter((tabId) => typeof tabId === "number"))];
   if (uniqueTabIds.length === 0) {
     return 0;
   }
 
-  const windowTabs = await chrome.tabs.query({ windowId });
-  const windowTabIds = windowTabs.map((tab) => tab.id).filter((tabId) => typeof tabId === "number");
-
-  if (windowTabIds.length > 0 && uniqueTabIds.length >= windowTabIds.length) {
-    await chrome.tabs.create({ windowId, url: NEW_TAB_URL, active: false });
+  let discardedCount = 0;
+  for (const tabId of uniqueTabIds) {
+    try {
+      await chrome.tabs.discard(tabId);
+      discardedCount += 1;
+    } catch (error) {
+      console.warn("Could not discard tab in place:", tabId, error);
+    }
   }
 
-  try {
-    await chrome.tabs.remove(uniqueTabIds);
-  } catch (error) {
-    console.warn("Some tabs could not be removed:", error);
-  }
-
-  if (state) {
-    removeTabAssignments(state, uniqueTabIds);
-  }
-
-  return uniqueTabIds.length;
+  return discardedCount;
 }
 
 async function sleepOpenTabsById(state, windowId, tabIds, reason) {
@@ -2161,20 +2447,15 @@ async function sleepOpenTabsById(state, windowId, tabIds, reason) {
     if (records.length === 0) {
       continue;
     }
-    appendSleepingTabs(workspace, records);
     pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
     workspace.updatedAt = now();
   }
 
   await saveState(state);
-  await closeTabsKeepingWindow(
-    windowId,
-    tabs.map((tab) => tab.id),
-    state
-  );
+  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
 
   return {
-    sleptCount: tabs.length,
+    sleptCount: discardedCount,
     workspaceId: ensured.workspaceId
   };
 }
@@ -2183,28 +2464,21 @@ async function sleepActiveWorkspaceTabs(state, windowId, reason) {
   const ensured = ensureWorkspaceForWindow(state, windowId);
   const workspace = state.workspaces[ensured.workspaceId];
 
-  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, ensured.workspaceId, {
-    assignUnknownToWorkspaceId: ensured.workspaceId
-  });
+  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, ensured.workspaceId);
   if (tabs.length === 0) {
     return { workspaceId: ensured.workspaceId, sleptCount: 0 };
   }
 
   const records = dedupeTabRecords(tabs.map(tabToRecord));
-  appendSleepingTabs(workspace, records);
   pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
   workspace.updatedAt = now();
 
   await saveState(state);
-  await closeTabsKeepingWindow(
-    windowId,
-    tabs.map((tab) => tab.id),
-    state
-  );
+  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
 
   clearDeferredSleep(state, windowId, workspace.id);
 
-  return { workspaceId: ensured.workspaceId, sleptCount: records.length };
+  return { workspaceId: ensured.workspaceId, sleptCount: discardedCount };
 }
 
 async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, options = {}) {
@@ -2239,9 +2513,7 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, optio
   const restoreResult = await restoreParkedWorkspaceTabsToWindow(state, windowId, targetWorkspaceId);
   openedCount += restoreResult.restoredCount;
 
-  const { tabs: visibleTargetTabs } = await getWorkspaceTabsForWindow(state, windowId, targetWorkspaceId, {
-    assignUnknownToWorkspaceId: targetWorkspaceId
-  });
+  const { tabs: visibleTargetTabs } = await getWorkspaceTabsForWindow(state, windowId, targetWorkspaceId);
 
   if (visibleTargetTabs.length === 0 && openSleepingTabsWhenEmpty) {
     const shouldOpenSleepingTabs = targetWorkspace.sessionTabs.length > 0;
@@ -2324,11 +2596,9 @@ async function sleepWorkspaceTabsAcrossWindows(state, workspaceId, reason) {
 
   const records = dedupeTabRecords(matchingTabs.map(tabToRecord));
   if (records.length > 0) {
-    appendSleepingTabs(workspace, records);
     pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
     workspace.updatedAt = now();
   }
-  workspace.parkedTabs = [];
 
   const tabIdsByWindow = new Map();
   for (const tab of matchingTabs) {
@@ -2338,14 +2608,15 @@ async function sleepWorkspaceTabsAcrossWindows(state, workspaceId, reason) {
     tabIdsByWindow.get(tab.windowId).push(tab.id);
   }
 
+  let discardedCount = 0;
   for (const [windowId, tabIds] of tabIdsByWindow.entries()) {
     await saveState(state);
-    await closeTabsKeepingWindow(windowId, tabIds, state);
+    discardedCount += await discardTabsInPlace(tabIds);
   }
 
   clearDeferredSleepForWorkspace(state, workspaceId);
   await cleanupParkedWindow(state, workspaceId);
-  return { sleptCount: records.length };
+  return { sleptCount: discardedCount };
 }
 
 async function archiveWorkspace(state, windowId, workspaceId) {
@@ -2476,6 +2747,10 @@ async function openDashboardInAllNormalWindows() {
   const tabs = await chrome.tabs.query({});
   const parkedWindowIds = getParkedWindowIds(state, tabs);
   const browserWindows = await chrome.windows.getAll();
+  let attemptedWindowCount = 0;
+  let dashboardWindowCount = 0;
+  let failedWindowCount = 0;
+
   for (const browserWindow of browserWindows) {
     if (!Number.isFinite(browserWindow?.id)) {
       continue;
@@ -2489,18 +2764,25 @@ async function openDashboardInAllNormalWindows() {
     if (browserWindow.incognito) {
       continue;
     }
+    attemptedWindowCount += 1;
     try {
       await openOrFocusDashboard(browserWindow.id);
+      dashboardWindowCount += 1;
     } catch (error) {
+      failedWindowCount += 1;
       console.warn("Could not open dashboard for window:", browserWindow.id, error);
     }
   }
+
+  return {
+    attemptedWindowCount,
+    dashboardWindowCount,
+    failedWindowCount
+  };
 }
 
 async function getOpenTabsForWindow(state, windowId, workspaceId) {
-  const { tabs, changed } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
-    assignUnknownToWorkspaceId: workspaceId
-  });
+  const { tabs, changed } = await getWorkspaceTabsForWindow(state, windowId, workspaceId);
 
   return {
     changed,
@@ -2520,13 +2802,13 @@ async function getOpenTabsForWindow(state, windowId, workspaceId) {
   };
 }
 
-async function getOpenTabCounts(state) {
+async function getOpenTabCounts(state, windowId = null) {
   const counts = {};
   for (const workspaceId of Object.keys(state.workspaces || {})) {
     counts[workspaceId] = 0;
   }
 
-  const tabs = await chrome.tabs.query({});
+  const tabs = await chrome.tabs.query(Number.isFinite(windowId) ? { windowId } : {});
   const parkedWindowIds = getParkedWindowIds(state, tabs);
   for (const tab of tabs) {
     if (
@@ -2574,13 +2856,13 @@ function compareSearchResults(left, right) {
   return String(left.title || left.url || "").localeCompare(String(right.title || right.url || ""));
 }
 
-async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT) {
+async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT, windowId = null) {
   return queueOperation(async () => {
     const state = await loadState();
     const safeLimit = Math.max(1, Math.min(25, Number(limit) || SEARCH_RESULT_LIMIT));
     const results = [];
     const historySeen = new Set();
-    const openTabs = await chrome.tabs.query({});
+    const openTabs = await chrome.tabs.query(Number.isFinite(windowId) ? { windowId } : {});
 
     for (const workspaceId of state.workspaceOrder) {
       const workspace = state.workspaces[workspaceId];
@@ -2699,9 +2981,7 @@ async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT) {
 }
 
 async function findWorkspaceTabInWindow(state, windowId, workspaceId, matcher) {
-  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
-    assignUnknownToWorkspaceId: workspaceId
-  });
+  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId);
   return tabs.find(matcher) || null;
 }
 
@@ -2867,7 +3147,7 @@ async function getDashboardData(windowId) {
       await notifyStateUpdated();
     }
 
-    const openTabCounts = await getOpenTabCounts(finalState);
+    const openTabCounts = await getOpenTabCounts(finalState, windowId);
     return buildDashboardPayload(finalState, windowId, openTabsResult.openTabs, openTabCounts);
   });
 }
@@ -2887,8 +3167,8 @@ async function runMemorySweep() {
   return mutateState(async (state) => {
     const cutoff = now() - state.settings.inactivityMinutes * 60 * 1000;
     const tabs = await chrome.tabs.query({});
-    let assignedCount = 0;
     let discardedCount = 0;
+    let skippedUnassignedCount = 0;
 
     for (const tab of tabs) {
       const url = getTabUrl(tab);
@@ -2906,18 +3186,12 @@ async function runMemorySweep() {
       }
 
       const tabIdKey = String(tab.id);
-      let workspaceId = state.tabWorkspaceById[tabIdKey];
+      const workspaceId = state.tabWorkspaceById[tabIdKey];
       if (!workspaceId || !state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
-        const windowWorkspaceId = state.activeWorkspaceByWindow[windowKey(tab.windowId)];
-        if (!windowWorkspaceId || !state.workspaces[windowWorkspaceId]) {
-          continue;
-        }
-        workspaceId = windowWorkspaceId;
-        setTabAssignments(state, [tab], workspaceId);
-        assignedCount += 1;
-      } else {
-        rememberTabRecord(state, tab);
+        skippedUnassignedCount += 1;
+        continue;
       }
+      rememberTabRecord(state, tab);
 
       try {
         await chrome.tabs.discard(tab.id);
@@ -2929,7 +3203,7 @@ async function runMemorySweep() {
 
     const clearedDeferredSleep = Object.keys(state.deferredSleepByWindow || {}).length > 0;
     state.deferredSleepByWindow = {};
-    return { discardedCount, assignedCount, sleptCount: 0, clearedDeferredSleep };
+    return { discardedCount, assignedCount: 0, skippedUnassignedCount, sleptCount: 0, clearedDeferredSleep };
   });
 }
 
@@ -2950,7 +3224,7 @@ async function handleMessage(message) {
     }
 
     case "SEARCH_WORKSPACE_CONTENT": {
-      return searchWorkspaceContent(payload.query, payload.limit);
+      return searchWorkspaceContent(payload.query, payload.limit, requestedWindowId);
     }
 
     case "CREATE_WORKSPACE": {
@@ -3218,23 +3492,14 @@ async function handleMessage(message) {
 
         await switchWorkspaceInWindow(state, requestedWindowId, workspace.id);
 
-        const { tabs: activeTabs } = await getWorkspaceTabsForWindow(state, requestedWindowId, workspace.id, {
-          assignUnknownToWorkspaceId: workspace.id
-        });
+        const { tabs: activeTabs } = await getWorkspaceTabsForWindow(state, requestedWindowId, workspace.id);
         const activeRecords = dedupeTabRecords(activeTabs.map(tabToRecord));
         if (activeRecords.length > 0) {
-          appendSleepingTabs(workspace, activeRecords);
           pushSnapshot(workspace, activeRecords, "restore", state.settings.maxSnapshotsPerWorkspace);
         }
 
         const openResult = await openTabRecords(requestedWindowId, snapshot.tabs, { openFallback: true });
         setTabAssignments(state, openResult.tabs, workspace.id);
-        await saveState(state);
-        await closeTabsKeepingWindow(
-          requestedWindowId,
-          activeTabs.map((tab) => tab.id),
-          state
-        );
 
         workspace.updatedAt = now();
         workspace.lastActivatedAt = now();
@@ -3320,32 +3585,18 @@ async function handleMessage(message) {
 }
 
 chrome.runtime.onInstalled.addListener((details) => {
-  void (async () => {
-    await loadState();
-    await hydrateOpenTabRecords();
-    await repairParkedWorkspaceWindows();
-    await ensureAlarm();
-    scheduleSyncExport(1000);
-
-    if (details.reason === "install" || details.reason === "update") {
-      try {
-        await openDashboardInAllNormalWindows();
-      } catch (error) {
-        console.warn("Could not open dashboard automatically after install/update:", error);
-      }
-    }
-  })();
+  const shouldOpenDashboard = details.reason === "install" || details.reason === "update";
+  void bootstrapExtensionRuntime(`installed:${details.reason}`, {
+    openDashboard: shouldOpenDashboard,
+    suppressTabAssignment: false
+  }).catch((error) => console.warn("Could not bootstrap Ordinator after install/update:", error));
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void (async () => {
-    await loadState();
-    await hydrateOpenTabRecords();
-    await repairParkedWorkspaceWindows();
-    await ensureAlarm();
-    scheduleSyncExport(1000);
-    await openDashboardInAllNormalWindows();
-  })();
+  void bootstrapExtensionRuntime("startup", {
+    openDashboard: true,
+    suppressTabAssignment: true
+  }).catch((error) => console.warn("Could not bootstrap Ordinator on startup:", error));
 });
 
 chrome.action.onClicked.addListener((tab) => {
@@ -3398,7 +3649,22 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
-  void assignNewTabToActiveWorkspace(tab);
+  void (async () => {
+    try {
+      const suppressAssignment = await shouldSuppressCreatedTabAssignment(tab);
+      if (!suppressAssignment) {
+        await assignNewTabToActiveWorkspace(tab, { allowNewAssignment: true });
+      }
+    } catch (error) {
+      console.warn("Could not assign created tab to workspace:", error);
+    } finally {
+      try {
+        await refreshExtensionHeartbeat("tab-created");
+      } catch (error) {
+        // Best effort only.
+      }
+    }
+  })();
   scheduleSyncExport();
 });
 
@@ -3433,6 +3699,30 @@ chrome.windows.onRemoved.addListener((windowId) => {
   });
 });
 
+chrome.windows.onCreated.addListener((browserWindow) => {
+  if (!Number.isFinite(browserWindow?.id) || (browserWindow.type && browserWindow.type !== "normal") || browserWindow.incognito) {
+    return;
+  }
+
+  void (async () => {
+    try {
+      await refreshExtensionHeartbeat("window-created");
+      const bootstrapState = await readStartupBootstrapState();
+      const retryUntil = Number(bootstrapState.dashboardRetryUntil);
+      if (!Number.isFinite(retryUntil) || retryUntil <= now()) {
+        return;
+      }
+      setTimeout(() => {
+        void runStartupDashboardRetry("window-created").catch((error) =>
+          console.warn("Could not retry startup dashboard after window creation:", error)
+        );
+      }, 1000);
+    } catch (error) {
+      console.warn("Could not process startup window creation:", error);
+    }
+  })();
+});
+
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (!Number.isFinite(windowId) || windowId === chrome.windows.WINDOW_ID_NONE) {
     return;
@@ -3448,8 +3738,23 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === STARTUP_DASHBOARD_ALARM) {
+    void runStartupDashboardRetry("startup-alarm").catch((error) =>
+      console.warn("Could not retry startup dashboard after alarm:", error)
+    );
+    return;
+  }
+
   if (alarm.name === MEMORY_ALARM) {
-    void runMemorySweep();
+    void (async () => {
+      try {
+        await refreshExtensionHeartbeat("memory-alarm");
+        await runMemorySweep();
+        await refreshExtensionHeartbeat("memory-sweep");
+      } catch (error) {
+        console.warn("Could not complete memory sweep:", error);
+      }
+    })();
   }
 });
 
