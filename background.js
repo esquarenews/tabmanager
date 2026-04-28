@@ -85,8 +85,16 @@ function isNewTabUrl(url) {
   );
 }
 
+function isDashboardUrl(url) {
+  const dashboardUrl = getDashboardUrl();
+  return typeof url === "string" && (url === dashboardUrl || url.startsWith(`${dashboardUrl}?`) || url.startsWith(`${dashboardUrl}#`));
+}
+
 function isWorkspaceManagedUrl(url) {
-  return isOpenableUrl(url) || isNewTabUrl(url);
+  if (typeof url !== "string" || url.trim().length === 0) {
+    return false;
+  }
+  return !isParkingNoticeUrl(url) && !isDashboardUrl(url);
 }
 
 function fallbackTitleForUrl(url) {
@@ -1767,10 +1775,27 @@ function takeStoredTabCandidate(candidatesByUrl, tab) {
   }
 
   const title = normalizeText(tab.title, fallbackTitleForUrl(url));
-  let candidateIndex = candidates.findIndex(
-    (candidate) => normalizeText(candidate.record?.title, fallbackTitleForUrl(candidate.record?.url)) === title
-  );
-  if (candidateIndex < 0) {
+  const matchingTitleIndexes = [];
+  const matchingTitleWorkspaceIds = new Set();
+  candidates.forEach((candidate, index) => {
+    if (normalizeText(candidate.record?.title, fallbackTitleForUrl(candidate.record?.url)) !== title) {
+      return;
+    }
+    matchingTitleIndexes.push(index);
+    matchingTitleWorkspaceIds.add(candidate.workspaceId);
+  });
+
+  let candidateIndex = -1;
+  if (matchingTitleIndexes.length > 0) {
+    if (matchingTitleWorkspaceIds.size > 1) {
+      return null;
+    }
+    candidateIndex = matchingTitleIndexes[0];
+  } else {
+    const workspaceIds = new Set(candidates.map((candidate) => candidate.workspaceId));
+    if (workspaceIds.size > 1) {
+      return null;
+    }
     candidateIndex = 0;
   }
 
@@ -2088,25 +2113,43 @@ async function parkWorkspaceTabsFromWindow(state, windowId, workspaceId, snapsho
   }
 
   const workspace = state.workspaces[workspaceId];
-  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId);
+  const { tabs } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
+    assignUnknownToWorkspaceId: workspaceId
+  });
   if (tabs.length === 0) {
     clearDeferredSleepForWorkspace(state, workspaceId);
+    await cleanupParkedWindow(state, workspaceId);
     return { parkedCount: 0 };
   }
 
+  const parkedWindowId = await ensureParkedWindow(state, workspaceId);
   const orderedTabs = [...tabs].sort((a, b) => a.index - b.index);
-  const records = dedupeTabRecords(orderedTabs.map(tabToRecord));
+  const movedTabIds = [];
+  const movedRecords = [];
 
   for (const tab of orderedTabs) {
+    if (!Number.isFinite(tab.id)) {
+      continue;
+    }
     rememberTabRecord(state, tab);
+    try {
+      await chrome.tabs.move(tab.id, { windowId: parkedWindowId, index: -1 });
+      movedTabIds.push(tab.id);
+      movedRecords.push(tabToRecord(tab));
+    } catch (error) {
+      console.warn("Failed to park workspace tab:", tab.id, error);
+    }
   }
 
-  if (snapshotReason) {
-    pushSnapshot(workspace, records, snapshotReason, state.settings.maxSnapshotsPerWorkspace);
+  const parkedRecords = dedupeTabRecords(movedRecords);
+  workspace.parkedTabs = dedupeTabRecords([...(workspace.parkedTabs || []), ...parkedRecords]);
+  if (snapshotReason && parkedRecords.length > 0) {
+    pushSnapshot(workspace, parkedRecords, snapshotReason, state.settings.maxSnapshotsPerWorkspace);
   }
   workspace.updatedAt = now();
   clearDeferredSleepForWorkspace(state, workspaceId);
-  return { parkedCount: 0 };
+  await cleanupParkedWindow(state, workspaceId);
+  return { parkedCount: movedTabIds.length, parkedWindowId };
 }
 
 async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) {
@@ -2167,7 +2210,9 @@ async function syncWindowWorkspaceVisibility(state, windowId, activeWorkspaceId)
     const tabIdKey = String(tab.id);
     let assignedWorkspaceId = state.tabWorkspaceById[tabIdKey];
     if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId] || Number.isFinite(state.workspaces[assignedWorkspaceId].archivedAt)) {
-      continue;
+      assignedWorkspaceId = activeWorkspaceId;
+      state.tabWorkspaceById[tabIdKey] = activeWorkspaceId;
+      changed = true;
     }
     changed = rememberTabRecord(state, tab) || changed;
     if (assignedWorkspaceId !== activeWorkspaceId) {
@@ -2246,7 +2291,8 @@ async function activateOrOpenWorkspaceTab(state, windowId, workspaceId, tabId, u
   };
 }
 
-async function getWorkspaceTabsForWindow(state, windowId, workspaceId) {
+async function getWorkspaceTabsForWindow(state, windowId, workspaceId, options = {}) {
+  const { assignUnknownToWorkspaceId = null } = options;
   const tabs = await getManageableWindowTabs(windowId);
   const output = [];
   let changed = false;
@@ -2259,7 +2305,16 @@ async function getWorkspaceTabsForWindow(state, windowId, workspaceId) {
     const key = String(tab.id);
     let assignedWorkspaceId = state.tabWorkspaceById[key];
     if (!assignedWorkspaceId || !state.workspaces[assignedWorkspaceId] || Number.isFinite(state.workspaces[assignedWorkspaceId].archivedAt)) {
-      continue;
+      if (
+        typeof assignUnknownToWorkspaceId !== "string" ||
+        !state.workspaces[assignUnknownToWorkspaceId] ||
+        Number.isFinite(state.workspaces[assignUnknownToWorkspaceId].archivedAt)
+      ) {
+        continue;
+      }
+      assignedWorkspaceId = assignUnknownToWorkspaceId;
+      state.tabWorkspaceById[key] = assignedWorkspaceId;
+      changed = true;
     }
     changed = rememberTabRecord(state, tab) || changed;
 
@@ -2581,6 +2636,7 @@ async function sleepWorkspaceTabsAcrossWindows(state, workspaceId, reason) {
   }
 
   const openTabs = await chrome.tabs.query({});
+  const parkedWindowIds = getParkedWindowIds(state, openTabs);
   const matchingTabs = openTabs.filter(
     (tab) =>
       Number.isFinite(tab?.id) &&
@@ -2594,29 +2650,45 @@ async function sleepWorkspaceTabsAcrossWindows(state, workspaceId, reason) {
     return { sleptCount: 0 };
   }
 
-  const records = dedupeTabRecords(matchingTabs.map(tabToRecord));
-  if (records.length > 0) {
-    pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
+  const visibleTabs = matchingTabs
+    .filter((tab) => !parkedWindowIds.has(tab.windowId))
+    .sort((left, right) => {
+      if (left.windowId !== right.windowId) {
+        return left.windowId - right.windowId;
+      }
+      return left.index - right.index;
+    });
+  const alreadyParkedRecords = dedupeTabRecords(
+    matchingTabs.filter((tab) => parkedWindowIds.has(tab.windowId)).map(tabToRecord)
+  );
+  const movedRecords = [];
+  let parkedWindowId = await getValidParkedWindowId(state, workspaceId);
+
+  if (visibleTabs.length > 0) {
+    parkedWindowId = await ensureParkedWindow(state, workspaceId);
+    for (const tab of visibleTabs) {
+      if (!Number.isFinite(tab.id)) {
+        continue;
+      }
+      rememberTabRecord(state, tab);
+      try {
+        await chrome.tabs.move(tab.id, { windowId: parkedWindowId, index: -1 });
+        movedRecords.push(tabToRecord(tab));
+      } catch (error) {
+        console.warn("Failed to move archived workspace tab into parked window:", tab.id, error);
+      }
+    }
+  }
+
+  const parkedRecords = dedupeTabRecords([...(workspace.parkedTabs || []), ...alreadyParkedRecords, ...movedRecords]);
+  if (parkedRecords.length > 0) {
+    workspace.parkedTabs = parkedRecords;
+    pushSnapshot(workspace, parkedRecords, reason, state.settings.maxSnapshotsPerWorkspace);
     workspace.updatedAt = now();
   }
-
-  const tabIdsByWindow = new Map();
-  for (const tab of matchingTabs) {
-    if (!tabIdsByWindow.has(tab.windowId)) {
-      tabIdsByWindow.set(tab.windowId, []);
-    }
-    tabIdsByWindow.get(tab.windowId).push(tab.id);
-  }
-
-  let discardedCount = 0;
-  for (const [windowId, tabIds] of tabIdsByWindow.entries()) {
-    await saveState(state);
-    discardedCount += await discardTabsInPlace(tabIds);
-  }
-
   clearDeferredSleepForWorkspace(state, workspaceId);
   await cleanupParkedWindow(state, workspaceId);
-  return { sleptCount: discardedCount };
+  return { sleptCount: alreadyParkedRecords.length + movedRecords.length, parkedWindowId };
 }
 
 async function archiveWorkspace(state, windowId, workspaceId) {
@@ -2862,7 +2934,7 @@ async function searchWorkspaceContent(query, limit = SEARCH_RESULT_LIMIT, window
     const safeLimit = Math.max(1, Math.min(25, Number(limit) || SEARCH_RESULT_LIMIT));
     const results = [];
     const historySeen = new Set();
-    const openTabs = await chrome.tabs.query(Number.isFinite(windowId) ? { windowId } : {});
+    const openTabs = await chrome.tabs.query({});
 
     for (const workspaceId of state.workspaceOrder) {
       const workspace = state.workspaces[workspaceId];
@@ -3009,6 +3081,23 @@ async function openSearchResult(state, windowId, payload) {
     };
   }
 
+  if (payload.kind === "open-tab" && Number.isFinite(payload.tabId)) {
+    try {
+      const existingTab = await chrome.tabs.get(payload.tabId);
+      if (
+        existingTab &&
+        !existingTab.pinned &&
+        isWorkspaceManagedUrl(getTabUrl(existingTab)) &&
+        Number.isFinite(existingTab.windowId) &&
+        existingTab.windowId !== windowId
+      ) {
+        return activateOrOpenWorkspaceTab(state, windowId, workspace.id, payload.tabId, payload.url, payload.title);
+      }
+    } catch (error) {
+      // Fall through if the tab no longer exists.
+    }
+  }
+
   await switchWorkspaceInWindow(state, windowId, workspace.id, {
     openSleepingTabsWhenEmpty: false
   });
@@ -3147,7 +3236,7 @@ async function getDashboardData(windowId) {
       await notifyStateUpdated();
     }
 
-    const openTabCounts = await getOpenTabCounts(finalState, windowId);
+    const openTabCounts = await getOpenTabCounts(finalState);
     return buildDashboardPayload(finalState, windowId, openTabsResult.openTabs, openTabCounts);
   });
 }
@@ -3670,7 +3759,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if ((typeof changeInfo.url === "string" || changeInfo.status === "complete") && tab) {
-    void assignNewTabToActiveWorkspace(tab);
+    void assignNewTabToActiveWorkspace(tab, { allowNewAssignment: true });
   }
   if (changeInfo.status === "complete" || typeof changeInfo.title === "string" || typeof changeInfo.url === "string") {
     scheduleSyncExport();
