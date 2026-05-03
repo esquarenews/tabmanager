@@ -208,15 +208,23 @@ function normalizeWorkspaceColor(color, seed) {
 }
 
 function dedupeTabRecords(records) {
+  const seen = new Set();
   const output = [];
 
   for (const record of records) {
     if (!record || !isWorkspaceManagedUrl(record.url)) {
       continue;
     }
+    const url = record.url;
+    const title = normalizeText(record.title, fallbackTitleForUrl(url));
+    const dedupeKey = `${url}\n${title}`;
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
     output.push({
-      url: record.url,
-      title: normalizeText(record.title, fallbackTitleForUrl(record.url)),
+      url,
+      title,
       favIconUrl: typeof record.favIconUrl === "string" ? record.favIconUrl : "",
       createdAt: Number.isFinite(record.createdAt) ? record.createdAt : now()
     });
@@ -2461,6 +2469,25 @@ async function discardTabsInPlace(tabIds) {
   return discardedCount;
 }
 
+async function removeTabsById(tabIds) {
+  const uniqueTabIds = [...new Set((tabIds || []).filter((tabId) => typeof tabId === "number"))];
+  if (uniqueTabIds.length === 0) {
+    return 0;
+  }
+
+  let removedCount = 0;
+  for (const tabId of uniqueTabIds) {
+    try {
+      await chrome.tabs.remove(tabId);
+      removedCount += 1;
+    } catch (error) {
+      console.warn("Could not remove tab:", tabId, error);
+    }
+  }
+
+  return removedCount;
+}
+
 async function sleepOpenTabsById(state, windowId, tabIds, reason) {
   const requestedTabIds = new Set((tabIds || []).filter((tabId) => Number.isFinite(tabId)));
   if (requestedTabIds.size === 0) {
@@ -2502,15 +2529,17 @@ async function sleepOpenTabsById(state, windowId, tabIds, reason) {
     if (records.length === 0) {
       continue;
     }
+    appendSleepingTabs(workspace, records);
     pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
     workspace.updatedAt = now();
+    clearDeferredSleep(state, windowId, workspaceId);
   }
 
   await saveState(state);
-  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
+  const removedCount = await removeTabsById(tabs.map((tab) => tab.id));
 
   return {
-    sleptCount: discardedCount,
+    sleptCount: removedCount,
     workspaceId: ensured.workspaceId
   };
 }
@@ -2525,15 +2554,15 @@ async function sleepActiveWorkspaceTabs(state, windowId, reason) {
   }
 
   const records = dedupeTabRecords(tabs.map(tabToRecord));
+  appendSleepingTabs(workspace, records);
   pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
   workspace.updatedAt = now();
-
-  await saveState(state);
-  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
-
   clearDeferredSleep(state, windowId, workspace.id);
 
-  return { workspaceId: ensured.workspaceId, sleptCount: discardedCount };
+  await saveState(state);
+  const removedCount = await removeTabsById(tabs.map((tab) => tab.id));
+
+  return { workspaceId: ensured.workspaceId, sleptCount: removedCount };
 }
 
 async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, options = {}) {
@@ -3722,14 +3751,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
     const working = structuredClone(state);
     const workspace = working.workspaces[workspaceId];
-    if (
-      workspace &&
-      record &&
-      isWorkspaceManagedUrl(record.url)
-    ) {
-      appendSleepingTabs(workspace, [record]);
+    if (workspace && record && isWorkspaceManagedUrl(record.url)) {
+      const previousParkedCount = Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs.length : 0;
       workspace.parkedTabs = removeFirstMatchingTabRecord(workspace.parkedTabs, record);
-      workspace.updatedAt = now();
+      if (workspace.parkedTabs.length !== previousParkedCount) {
+        workspace.updatedAt = now();
+      }
     }
     removeTabAssignments(working, [tabId]);
     await saveState(working);
