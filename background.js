@@ -207,6 +207,12 @@ function normalizeWorkspaceColor(color, seed) {
   return colorForWorkspaceSeed(seed);
 }
 
+function getTabRecordKey(record) {
+  const url = typeof record?.url === "string" ? record.url : "";
+  const title = normalizeText(record?.title, fallbackTitleForUrl(url));
+  return `${url}\n${title}`;
+}
+
 function dedupeTabRecords(records) {
   const seen = new Set();
   const output = [];
@@ -217,7 +223,7 @@ function dedupeTabRecords(records) {
     }
     const url = record.url;
     const title = normalizeText(record.title, fallbackTitleForUrl(url));
-    const dedupeKey = `${url}\n${title}`;
+    const dedupeKey = getTabRecordKey({ url, title });
     if (seen.has(dedupeKey)) {
       continue;
     }
@@ -2488,6 +2494,73 @@ async function removeTabsById(tabIds) {
   return removedCount;
 }
 
+async function deleteSelectedTabsPermanently(state, windowId, workspaceId, openTabIds = [], sleepingTabs = []) {
+  const uniqueOpenTabIds = [...new Set((openTabIds || []).filter((tabId) => Number.isFinite(tabId)))];
+  const selectedSleepingKeys = new Set(
+    (sleepingTabs || [])
+      .filter((record) => record && typeof record === "object")
+      .map((record) => getTabRecordKey(record))
+  );
+
+  let deletedSleepingCount = 0;
+  if (selectedSleepingKeys.size > 0) {
+    const workspace = state.workspaces[workspaceId];
+    if (!workspace || Number.isFinite(workspace.archivedAt)) {
+      throw new Error("Workspace not found.");
+    }
+
+    const originalTabs = Array.isArray(workspace.sessionTabs) ? workspace.sessionTabs : [];
+    const remainingTabs = [];
+    for (const record of originalTabs) {
+      if (selectedSleepingKeys.has(getTabRecordKey(record))) {
+        deletedSleepingCount += 1;
+        continue;
+      }
+      remainingTabs.push(record);
+    }
+
+    if (deletedSleepingCount > 0) {
+      workspace.sessionTabs = remainingTabs;
+      workspace.updatedAt = now();
+    }
+  }
+
+  let deletedOpenCount = 0;
+  if (uniqueOpenTabIds.length > 0) {
+    const requestedOpenTabIds = new Set(uniqueOpenTabIds);
+    const windowTabs = await chrome.tabs.query({ windowId });
+    const tabsToDelete = windowTabs.filter(
+      (tab) =>
+        Number.isFinite(tab?.id) &&
+        requestedOpenTabIds.has(tab.id) &&
+        !tab.pinned &&
+        isWorkspaceManagedUrl(getTabUrl(tab))
+    );
+
+    if (tabsToDelete.length > 0) {
+      const touchedWorkspaceIds = new Set();
+      for (const tab of tabsToDelete) {
+        const assignedWorkspaceId = state.tabWorkspaceById[String(tab.id)];
+        if (assignedWorkspaceId && state.workspaces[assignedWorkspaceId]) {
+          touchedWorkspaceIds.add(assignedWorkspaceId);
+        }
+      }
+
+      removeTabAssignments(state, tabsToDelete.map((tab) => tab.id));
+      for (const touchedWorkspaceId of touchedWorkspaceIds) {
+        state.workspaces[touchedWorkspaceId].updatedAt = now();
+      }
+      deletedOpenCount = await removeTabsById(tabsToDelete.map((tab) => tab.id));
+    }
+  }
+
+  return {
+    deletedOpenCount,
+    deletedSleepingCount,
+    deletedCount: deletedOpenCount + deletedSleepingCount
+  };
+}
+
 async function sleepOpenTabsById(state, windowId, tabIds, reason) {
   const requestedTabIds = new Set((tabIds || []).filter((tabId) => Number.isFinite(tabId)));
   if (requestedTabIds.size === 0) {
@@ -3512,6 +3585,18 @@ async function handleMessage(message) {
         const result = await sleepOpenTabsById(state, requestedWindowId, [payload.tabId], "manual");
         return { slept: result.sleptCount > 0, tabId: payload.tabId, ...result };
       });
+    }
+
+    case "DELETE_SELECTED_TABS": {
+      return mutateState(async (state) =>
+        deleteSelectedTabsPermanently(
+          state,
+          requestedWindowId,
+          payload.workspaceId,
+          payload.openTabIds,
+          payload.sleepingTabs
+        )
+      );
     }
 
     case "ACTIVATE_OPEN_TAB": {

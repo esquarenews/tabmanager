@@ -20,6 +20,7 @@ const ui = {
   syncNowButton: document.querySelector("#syncNowButton"),
   settingsRailButton: document.querySelector("#settingsRailButton"),
   sleepButton: document.querySelector("#sleepButton"),
+  deleteSelectedButton: document.querySelector("#deleteSelectedButton"),
   wakeButton: document.querySelector("#wakeButton"),
   tabButtons: Array.from(document.querySelectorAll(".tab-button")),
   template: document.querySelector("#itemTemplate")
@@ -36,6 +37,12 @@ const searchState = {
   lastIssuedQuery: "",
   requestId: 0,
   results: []
+};
+
+const selectionState = {
+  workspaceId: null,
+  openTabIds: new Set(),
+  sleepingTabKeys: new Set()
 };
 
 const EXPANDED_PARKED_WORKSPACES_MIN_WIDTH = 1700;
@@ -284,6 +291,119 @@ function clearToast() {
 
 function currentWorkspace() {
   return state.dashboard?.activeWorkspace || null;
+}
+
+function selectedTabCount() {
+  return selectionState.openTabIds.size + selectionState.sleepingTabKeys.size;
+}
+
+function makeSleepingTabSelectionKey(tab) {
+  const url = typeof tab?.url === "string" ? tab.url : "";
+  const title = typeof tab?.title === "string" && tab.title.trim().length > 0 ? tab.title.trim() : url || "Untitled";
+  return `${url}\n${title}`;
+}
+
+function updateDeleteSelectedButton() {
+  if (!ui.deleteSelectedButton) {
+    return;
+  }
+  const count = selectedTabCount();
+  const enabled = state.activeView === "tabs" && count > 0;
+  ui.deleteSelectedButton.disabled = !enabled;
+  ui.deleteSelectedButton.title =
+    count > 0 ? `Delete ${count} selected tab${count === 1 ? "" : "s"}` : "Delete selected tabs";
+  ui.deleteSelectedButton.setAttribute("aria-label", ui.deleteSelectedButton.title);
+}
+
+function resetTabSelection(workspaceId = state.dashboard?.activeWorkspace?.id || null) {
+  selectionState.workspaceId = workspaceId;
+  selectionState.openTabIds = new Set();
+  selectionState.sleepingTabKeys = new Set();
+  updateDeleteSelectedButton();
+}
+
+function ensureSelectionWorkspace() {
+  const workspaceId = state.dashboard?.activeWorkspace?.id || null;
+  if (selectionState.workspaceId !== workspaceId) {
+    resetTabSelection(workspaceId);
+  }
+  return workspaceId;
+}
+
+function syncTabSelection() {
+  const workspace = currentWorkspace();
+  if (!workspace) {
+    resetTabSelection(null);
+    return;
+  }
+
+  if (selectionState.workspaceId !== workspace.id) {
+    resetTabSelection(workspace.id);
+    return;
+  }
+
+  const visibleOpenTabIds = new Set((state.dashboard?.openTabs || []).map((tab) => tab.id).filter((tabId) => Number.isFinite(tabId)));
+  selectionState.openTabIds = new Set([...selectionState.openTabIds].filter((tabId) => visibleOpenTabIds.has(tabId)));
+
+  const visibleSleepingKeys = new Set((workspace.sessionTabs || []).map(makeSleepingTabSelectionKey));
+  selectionState.sleepingTabKeys = new Set(
+    [...selectionState.sleepingTabKeys].filter((selectionKey) => visibleSleepingKeys.has(selectionKey))
+  );
+
+  updateDeleteSelectedButton();
+}
+
+function setOpenTabSelected(tabId, checked) {
+  if (!Number.isFinite(tabId)) {
+    return;
+  }
+  ensureSelectionWorkspace();
+  if (checked) {
+    selectionState.openTabIds.add(tabId);
+  } else {
+    selectionState.openTabIds.delete(tabId);
+  }
+  updateDeleteSelectedButton();
+}
+
+function setSleepingTabSelected(tab, checked) {
+  const selectionKey = makeSleepingTabSelectionKey(tab);
+  ensureSelectionWorkspace();
+  if (checked) {
+    selectionState.sleepingTabKeys.add(selectionKey);
+  } else {
+    selectionState.sleepingTabKeys.delete(selectionKey);
+  }
+  updateDeleteSelectedButton();
+}
+
+function createSelectionControl(checked, label, onChange) {
+  const wrapper = document.createElement("label");
+  wrapper.className = "item-select";
+  wrapper.draggable = false;
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.className = "item-checkbox";
+  checkbox.checked = checked;
+  checkbox.draggable = false;
+  checkbox.setAttribute("aria-label", label);
+
+  const stopEvent = (event) => {
+    event.stopPropagation();
+  };
+
+  wrapper.addEventListener("mousedown", stopEvent);
+  wrapper.addEventListener("click", stopEvent);
+  checkbox.addEventListener("mousedown", stopEvent);
+  checkbox.addEventListener("click", stopEvent);
+  checkbox.addEventListener("change", (event) => {
+    event.stopPropagation();
+    onChange(checkbox.checked);
+  });
+
+  wrapper.appendChild(checkbox);
+  return wrapper;
 }
 
 function workspaceOpenTabCount(workspace) {
@@ -812,11 +932,16 @@ function renderParkedWorkspaceList() {
   }
 }
 
-function makeItemCard({ title, subtitle, actions, titleNode = null }) {
+function makeItemCard({ title, subtitle, actions, titleNode = null, leadingControl = null }) {
   const node = ui.template.content.firstElementChild.cloneNode(true);
   const titleEl = node.querySelector(".item-title");
   const subtitleEl = node.querySelector(".item-subtitle");
   const actionsEl = node.querySelector(".item-actions");
+
+  if (leadingControl instanceof Node) {
+    leadingControl.classList.add("item-leading-control");
+    node.prepend(leadingControl);
+  }
 
   if (titleNode instanceof Node) {
     titleNode.classList.add("item-title");
@@ -901,13 +1026,19 @@ function renderTabsView(workspace) {
           "Tab opened."
         );
 
+      const isSelected = selectionState.openTabIds.has(tab.id);
       const card = makeItemCard({
         title: tab.title,
         subtitle: `${tab.discarded ? "Sleeping in place · " : ""}${formatDisplayUrl(tab.url, { baseOnly: true, maxLength: 48 })}`,
-        actions: []
+        actions: [],
+        leadingControl: createSelectionControl(isSelected, `Select ${tab.title}`, (checked) => {
+          setOpenTabSelected(tab.id, checked);
+          card.classList.toggle("selected", checked);
+        })
       });
       card.draggable = true;
       card.classList.add("draggable-item");
+      card.classList.toggle("selected", isSelected);
       wireItemCopyOpen(card, `Open ${tab.title}`, () => {
         void openTabFromList();
       });
@@ -1055,13 +1186,19 @@ function renderTabsView(workspace) {
           "Opened sleeping tab."
         );
 
+      const isSelected = selectionState.sleepingTabKeys.has(makeSleepingTabSelectionKey(tab));
       const card = makeItemCard({
         title: tab.title,
         subtitle: formatDisplayUrl(tab.url, { maxLength: 72 }),
-        actions: []
+        actions: [],
+        leadingControl: createSelectionControl(isSelected, `Select ${tab.title}`, (checked) => {
+          setSleepingTabSelected(tab, checked);
+          card.classList.toggle("selected", checked);
+        })
       });
       card.draggable = true;
       card.classList.add("draggable-item");
+      card.classList.toggle("selected", isSelected);
       wireItemCopyOpen(card, `Open ${tab.title}`, () => {
         void openSleepingTabFromList();
       });
@@ -1666,9 +1803,11 @@ function renderMainContent() {
 function render() {
   const workspace = currentWorkspace();
   if (!workspace) {
+    resetTabSelection(null);
     return;
   }
 
+  syncTabSelection();
   renderWorkspaceList();
   renderParkedWorkspaceList();
   ui.workspaceName.textContent = workspace.name;
@@ -1687,6 +1826,7 @@ function render() {
   }
 
   renderMainContent();
+  updateDeleteSelectedButton();
 }
 
 async function refreshDashboard(silent = false) {
@@ -1708,6 +1848,50 @@ async function runAction(action, successMessage) {
     setToast(successMessage, "success");
   } catch (error) {
     setToast(error.message || "Action failed.", "error");
+  }
+}
+
+async function deleteSelectedTabs() {
+  const workspace = currentWorkspace();
+  if (!workspace) {
+    return;
+  }
+
+  ensureSelectionWorkspace();
+  const openTabIds = [...selectionState.openTabIds];
+  const sleepingTabs = workspace.sessionTabs
+    .filter((tab) => selectionState.sleepingTabKeys.has(makeSleepingTabSelectionKey(tab)))
+    .map((tab) => ({
+      url: tab.url,
+      title: tab.title
+    }));
+
+  const totalSelectedCount = openTabIds.length + sleepingTabs.length;
+  if (totalSelectedCount === 0) {
+    updateDeleteSelectedButton();
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Delete ${totalSelectedCount} selected tab${totalSelectedCount === 1 ? "" : "s"} permanently? This cannot be undone.`
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const result = await send("DELETE_SELECTED_TABS", {
+      windowId: state.windowId,
+      workspaceId: workspace.id,
+      openTabIds,
+      sleepingTabs
+    });
+    resetTabSelection(workspace.id);
+    await refreshDashboard(true);
+    const deletedCount = Number(result?.deletedCount) || 0;
+    setToast(`Deleted ${deletedCount} selected tab${deletedCount === 1 ? "" : "s"}.`, "success");
+  } catch (error) {
+    setToast(error.message || "Could not delete selected tabs.", "error");
   }
 }
 
@@ -1816,6 +2000,12 @@ function wireEvents() {
       "Open tabs were put to sleep."
     );
   });
+
+  if (ui.deleteSelectedButton) {
+    ui.deleteSelectedButton.addEventListener("click", () => {
+      void deleteSelectedTabs();
+    });
+  }
 
   ui.wakeButton.addEventListener("click", () => {
     void runAction(

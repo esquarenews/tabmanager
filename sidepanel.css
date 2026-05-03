@@ -485,7 +485,9 @@ body {
 
 .header-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+  justify-content: end;
 }
 
 button {
@@ -515,6 +517,32 @@ button.primary:hover {
 
 button.danger {
   color: var(--danger);
+}
+
+button.danger-soft {
+  border-color: rgba(190, 18, 60, 0.2);
+  background: #fff1f4;
+  color: var(--danger);
+}
+
+button.danger-soft:hover {
+  border-color: rgba(190, 18, 60, 0.34);
+  background: #ffe4ea;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+
+button:disabled:hover {
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+button.danger-soft:disabled:hover {
+  border-color: rgba(190, 18, 60, 0.2);
+  background: #fff1f4;
 }
 
 .workspace-name-wrap .workspace-swatch-button {
@@ -602,6 +630,11 @@ button.danger {
   position: relative;
 }
 
+.list-item.selected {
+  border-color: rgba(29, 78, 216, 0.4);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
+}
+
 .list-item:has(.action-menu[open]) {
   z-index: 30;
 }
@@ -624,6 +657,25 @@ button.danger {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
+}
+
+.item-leading-control {
+  flex: 0 0 auto;
+}
+
+.item-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: 2px;
+}
+
+.item-checkbox {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .item-copy.clickable {
