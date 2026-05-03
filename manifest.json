@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Ordinator",
   "description": "Workspace-based tab manager with sleep/wake, snapshots, resources, and memory cleanup.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoDO/ft/gNT54mU5bi4tArqpmZRfqUwB6LIJXYbIJA7zCpnU96ya5yyiTuwSXsVuak3KQU+EePlKFJkXzXIPtFM8sd3ey9Q1xGjC6wXKWpmA1iG6H2Xbjk5DSj53K9zNdtgoC7jOAr6sgFY2ru709Z3qt5bWwp5qwL202OHgFstJ0VSTW8HS7iHl/reypiMiDDzJxGLX3jEdk+qiz/NKAHIPQ+kJwoYplJyUhJe1Hwk94HoqvDSgJekpuv7gk4TdYPXPi84VBv3/IWjrZzfdccbOJi/NtwSvsU6ffhDa8NcuFf60dYeUXEZI5BPj7bxKrFF+eKe+T/pfUoE3Rw9ljYQIDAQAB",
   "permissions": [
     "alarms",
