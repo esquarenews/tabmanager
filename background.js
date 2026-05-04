@@ -3809,7 +3809,7 @@ chrome.action.onClicked.addListener((tab) => {
   })();
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener((tabId, removeInfo = {}) => {
   scheduleSyncExport();
   void queueOperation(async () => {
     const state = await loadState();
@@ -3837,10 +3837,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     const working = structuredClone(state);
     const workspace = working.workspaces[workspaceId];
     if (workspace && record && isWorkspaceManagedUrl(record.url)) {
-      const previousParkedCount = Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs.length : 0;
-      workspace.parkedTabs = removeFirstMatchingTabRecord(workspace.parkedTabs, record);
-      if (workspace.parkedTabs.length !== previousParkedCount) {
+      if (removeInfo?.isWindowClosing) {
+        appendSleepingTabs(workspace, [record]);
         workspace.updatedAt = now();
+      } else {
+        const previousParkedCount = Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs.length : 0;
+        workspace.parkedTabs = removeFirstMatchingTabRecord(workspace.parkedTabs, record);
+        if (workspace.parkedTabs.length !== previousParkedCount) {
+          workspace.updatedAt = now();
+        }
       }
     }
     removeTabAssignments(working, [tabId]);
