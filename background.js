@@ -910,8 +910,8 @@ function sanitizeStateForPortableTransfer(state, options = {}) {
     const parkedTabs = dedupeTabRecords(Array.isArray(workspace?.parkedTabs) ? workspace.parkedTabs : []);
     const sleepingTabs = dedupeTabRecords(Array.isArray(workspace?.sessionTabs) ? workspace.sessionTabs : []);
     const openTabs = dedupeTabRecords(portableOpenTabsByWorkspace[workspace.id] || []);
-    workspace.sessionTabs = dedupeTabRecords([...openTabs, ...parkedTabs, ...sleepingTabs]);
-    workspace.parkedTabs = [];
+    workspace.parkedTabs = dedupeTabRecords([...openTabs, ...parkedTabs]);
+    workspace.sessionTabs = sleepingTabs;
   }
 
   normalized.activeWorkspaceByWindow = {};
@@ -1205,7 +1205,7 @@ async function runStartupDashboardRetry(reason) {
 
   if (Number(bootstrapState.suppressAssignmentUntil) > now()) {
     try {
-      await hydrateOpenTabRecords({ trustExistingTabIds: false, includeSleepingTabs: true });
+      await hydrateOpenTabRecords({ trustExistingTabIds: false, includeSleepingTabs: false });
     } catch (error) {
       console.warn("Could not rehydrate restored tabs during startup retry:", error);
     }
@@ -1243,7 +1243,7 @@ async function bootstrapExtensionRuntime(reason, options = {}) {
     await loadState();
     await hydrateOpenTabRecords({
       trustExistingTabIds: !suppressTabAssignment,
-      includeSleepingTabs: suppressTabAssignment
+      includeSleepingTabs: false
     });
     await repairParkedWorkspaceWindows();
     await ensureAlarm();
@@ -1691,16 +1691,9 @@ async function collapseParkedWorkspaceWindow(state, workspaceId) {
     const records = recordsByWorkspaceId.get(candidateWorkspaceId) || fallbackRecords;
 
     if (records.length > 0) {
-      appendSleepingTabs(candidateWorkspace, records);
+      appendParkedTabs(candidateWorkspace, records);
       collapsedCount += records.length;
       changed = true;
-    }
-
-    if (Array.isArray(candidateWorkspace.parkedTabs) && candidateWorkspace.parkedTabs.length > 0) {
-      candidateWorkspace.parkedTabs = [];
-      changed = true;
-    } else {
-      candidateWorkspace.parkedTabs = [];
     }
 
     clearDeferredSleepForWorkspace(state, candidateWorkspaceId);
@@ -1766,9 +1759,7 @@ async function repairParkedWorkspaceWindows() {
       if (!Array.isArray(workspace?.parkedTabs) || workspace.parkedTabs.length === 0) {
         continue;
       }
-      const movedCount = moveParkedTabsToSleeping(working, workspace, "parked-window-missing");
-      collapsedCount += movedCount;
-      changed = true;
+      collapsedCount += workspace.parkedTabs.length;
     }
 
     if (!changed) {
@@ -2172,11 +2163,30 @@ async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) 
   }
 
   const workspace = state.workspaces[workspaceId];
+  const restoreSavedParkedRecords = async () => {
+    const savedRecords = dedupeTabRecords(Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs : []);
+    if (savedRecords.length === 0) {
+      workspace.parkedTabs = [];
+      return { restoredCount: 0 };
+    }
+
+    const openResult = await openTabRecords(windowId, savedRecords, {
+      openFallback: false,
+      activateFirst: false
+    });
+    if (openResult.openedCount > 0) {
+      setTabAssignments(state, openResult.tabs, workspaceId);
+      workspace.parkedTabs = [];
+      workspace.updatedAt = now();
+    }
+    clearDeferredSleepForWorkspace(state, workspaceId);
+    return { restoredCount: openResult.openedCount };
+  };
+
   const parkedWindowId = await getValidParkedWindowId(state, workspaceId);
   if (!Number.isFinite(parkedWindowId) || parkedWindowId === windowId) {
     clearDeferredSleepForWorkspace(state, workspaceId);
-    moveParkedTabsToSleeping(state, workspace, "parked-window-closed");
-    return { restoredCount: 0 };
+    return restoreSavedParkedRecords();
   }
 
   const parkedTabs = await chrome.tabs.query({ windowId: parkedWindowId });
@@ -2193,8 +2203,7 @@ async function restoreParkedWorkspaceTabsToWindow(state, windowId, workspaceId) 
   if (workspaceTabs.length === 0) {
     clearDeferredSleepForWorkspace(state, workspaceId);
     await cleanupParkedWindow(state, workspaceId);
-    moveParkedTabsToSleeping(state, workspace, "parked-window-closed");
-    return { restoredCount: 0 };
+    return restoreSavedParkedRecords();
   }
 
   const remainingRecords = [];
@@ -2354,6 +2363,10 @@ function appendSleepingTabs(workspace, records) {
   workspace.sessionTabs = dedupeTabRecords([...(records || []), ...(workspace.sessionTabs || [])]);
 }
 
+function appendParkedTabs(workspace, records) {
+  workspace.parkedTabs = dedupeTabRecords([...(workspace.parkedTabs || []), ...(records || [])]);
+}
+
 function removeFirstMatchingTabRecord(records, record) {
   if (!Array.isArray(records) || !record) {
     return records || [];
@@ -2385,20 +2398,6 @@ function pushSnapshot(workspace, records, reason, maxSnapshots) {
     tabs
   });
   workspace.history = workspace.history.slice(0, maxSnapshots);
-}
-
-function moveParkedTabsToSleeping(state, workspace, reason) {
-  const parkedRecords = dedupeTabRecords(Array.isArray(workspace?.parkedTabs) ? workspace.parkedTabs : []);
-  if (parkedRecords.length === 0) {
-    workspace.parkedTabs = [];
-    return 0;
-  }
-
-  appendSleepingTabs(workspace, parkedRecords);
-  pushSnapshot(workspace, parkedRecords, reason, state.settings.maxSnapshotsPerWorkspace);
-  workspace.parkedTabs = [];
-  workspace.updatedAt = now();
-  return parkedRecords.length;
 }
 
 async function openTabRecords(windowId, records, options = {}) {
@@ -2639,7 +2638,7 @@ async function sleepActiveWorkspaceTabs(state, windowId, reason) {
 }
 
 async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, options = {}) {
-  const openSleepingTabsWhenEmpty = options.openSleepingTabsWhenEmpty !== false;
+  const openSleepingTabsWhenEmpty = options.openSleepingTabsWhenEmpty === true;
 
   if (!state.workspaces[targetWorkspaceId] || Number.isFinite(state.workspaces[targetWorkspaceId].archivedAt)) {
     throw new Error("Workspace not found.");
@@ -2670,18 +2669,19 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, optio
   const restoreResult = await restoreParkedWorkspaceTabsToWindow(state, windowId, targetWorkspaceId);
   openedCount += restoreResult.restoredCount;
 
-  const { tabs: visibleTargetTabs } = await getWorkspaceTabsForWindow(state, windowId, targetWorkspaceId);
-
-  if (visibleTargetTabs.length === 0 && openSleepingTabsWhenEmpty) {
+  if (openSleepingTabsWhenEmpty) {
+    const { tabs: visibleTargetTabs } = await getWorkspaceTabsForWindow(state, windowId, targetWorkspaceId);
     const shouldOpenSleepingTabs = targetWorkspace.sessionTabs.length > 0;
-    const openResult = await openTabRecords(windowId, targetWorkspace.sessionTabs, {
-      openFallback: false,
-      activateFirst: false
-    });
-    openedCount += openResult.openedCount;
-    setTabAssignments(state, openResult.tabs, targetWorkspaceId);
-    if (shouldOpenSleepingTabs && openResult.openedCount > 0) {
-      targetWorkspace.sessionTabs = [];
+    if (visibleTargetTabs.length === 0 && shouldOpenSleepingTabs) {
+      const openResult = await openTabRecords(windowId, targetWorkspace.sessionTabs, {
+        openFallback: false,
+        activateFirst: false
+      });
+      openedCount += openResult.openedCount;
+      setTabAssignments(state, openResult.tabs, targetWorkspaceId);
+      if (openResult.openedCount > 0) {
+        targetWorkspace.sessionTabs = [];
+      }
     }
   }
 
@@ -3838,7 +3838,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo = {}) => {
     const workspace = working.workspaces[workspaceId];
     if (workspace && record && isWorkspaceManagedUrl(record.url)) {
       if (removeInfo?.isWindowClosing) {
-        appendSleepingTabs(workspace, [record]);
+        appendParkedTabs(workspace, [record]);
         workspace.updatedAt = now();
       } else {
         const previousParkedCount = Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs.length : 0;
@@ -3896,7 +3896,8 @@ chrome.windows.onRemoved.addListener((windowId) => {
     for (const workspaceId of workspaceIds) {
       const workspace = working.workspaces[workspaceId];
       if (workspace) {
-        moveParkedTabsToSleeping(working, workspace, "parked-window-closed");
+        workspace.parkedTabs = dedupeTabRecords(Array.isArray(workspace.parkedTabs) ? workspace.parkedTabs : []);
+        workspace.updatedAt = now();
       }
     }
     clearParkedWindowReferences(working, windowId);
