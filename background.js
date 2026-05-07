@@ -1519,18 +1519,6 @@ async function ensureParkingNoticeTab(windowId) {
     // Best effort only.
   }
 
-  const duplicateNoticeIds = noticeTabs
-    .slice(1)
-    .map((tab) => tab.id)
-    .filter((tabId) => Number.isFinite(tabId));
-  if (duplicateNoticeIds.length > 0) {
-    try {
-      await chrome.tabs.remove(duplicateNoticeIds);
-    } catch (error) {
-      // Best effort only.
-    }
-  }
-
   return noticeTab.id;
 }
 
@@ -2474,23 +2462,24 @@ async function discardTabsInPlace(tabIds) {
   return discardedCount;
 }
 
-async function removeTabsById(tabIds) {
+async function deleteTabsByUserRequest(tabIds) {
   const uniqueTabIds = [...new Set((tabIds || []).filter((tabId) => typeof tabId === "number"))];
   if (uniqueTabIds.length === 0) {
     return 0;
   }
 
-  let removedCount = 0;
+  // Keep chrome.tabs.remove confined to the explicit confirmed delete flow.
+  let deletedCount = 0;
   for (const tabId of uniqueTabIds) {
     try {
       await chrome.tabs.remove(tabId);
-      removedCount += 1;
+      deletedCount += 1;
     } catch (error) {
-      console.warn("Could not remove tab:", tabId, error);
+      console.warn("Could not delete tab after explicit user request:", tabId, error);
     }
   }
 
-  return removedCount;
+  return deletedCount;
 }
 
 async function deleteSelectedTabsPermanently(state, windowId, workspaceId, openTabIds = [], sleepingTabs = []) {
@@ -2533,7 +2522,8 @@ async function deleteSelectedTabsPermanently(state, windowId, workspaceId, openT
         Number.isFinite(tab?.id) &&
         requestedOpenTabIds.has(tab.id) &&
         !tab.pinned &&
-        isWorkspaceManagedUrl(getTabUrl(tab))
+        isWorkspaceManagedUrl(getTabUrl(tab)) &&
+        state.tabWorkspaceById[String(tab.id)] === workspaceId
     );
 
     if (tabsToDelete.length > 0) {
@@ -2549,7 +2539,7 @@ async function deleteSelectedTabsPermanently(state, windowId, workspaceId, openT
       for (const touchedWorkspaceId of touchedWorkspaceIds) {
         state.workspaces[touchedWorkspaceId].updatedAt = now();
       }
-      deletedOpenCount = await removeTabsById(tabsToDelete.map((tab) => tab.id));
+      deletedOpenCount = await deleteTabsByUserRequest(tabsToDelete.map((tab) => tab.id));
     }
   }
 
@@ -2601,17 +2591,16 @@ async function sleepOpenTabsById(state, windowId, tabIds, reason) {
     if (records.length === 0) {
       continue;
     }
-    appendSleepingTabs(workspace, records);
     pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
     workspace.updatedAt = now();
     clearDeferredSleep(state, windowId, workspaceId);
   }
 
   await saveState(state);
-  const removedCount = await removeTabsById(tabs.map((tab) => tab.id));
+  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
 
   return {
-    sleptCount: removedCount,
+    sleptCount: discardedCount,
     workspaceId: ensured.workspaceId
   };
 }
@@ -2626,15 +2615,14 @@ async function sleepActiveWorkspaceTabs(state, windowId, reason) {
   }
 
   const records = dedupeTabRecords(tabs.map(tabToRecord));
-  appendSleepingTabs(workspace, records);
   pushSnapshot(workspace, records, reason, state.settings.maxSnapshotsPerWorkspace);
   workspace.updatedAt = now();
   clearDeferredSleep(state, windowId, workspace.id);
 
   await saveState(state);
-  const removedCount = await removeTabsById(tabs.map((tab) => tab.id));
+  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
 
-  return { workspaceId: ensured.workspaceId, sleptCount: removedCount };
+  return { workspaceId: ensured.workspaceId, sleptCount: discardedCount };
 }
 
 async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, options = {}) {
@@ -2647,14 +2635,16 @@ async function switchWorkspaceInWindow(state, windowId, targetWorkspaceId, optio
   const key = windowKey(windowId);
   const currentWorkspaceId = state.activeWorkspaceByWindow[key];
   if (currentWorkspaceId === targetWorkspaceId) {
-    const visibilityResult = await syncWindowWorkspaceVisibility(state, windowId, targetWorkspaceId);
+    const { changed } = await getWorkspaceTabsForWindow(state, windowId, targetWorkspaceId, {
+      assignUnknownToWorkspaceId: targetWorkspaceId
+    });
     const restoreResult = await restoreParkedWorkspaceTabsToWindow(state, windowId, targetWorkspaceId);
     return {
       activeWorkspaceId: targetWorkspaceId,
       openedCount: restoreResult.restoredCount,
       sleptCount: 0,
       parkedCount: 0,
-      visibilityChanged: visibilityResult.changed
+      visibilityChanged: changed
     };
   }
 
@@ -2887,14 +2877,6 @@ async function openOrFocusDashboard(windowId) {
     await chrome.tabs.update(existingDashboardTab.id, { active: true, pinned: true });
     await chrome.tabs.move(existingDashboardTab.id, { windowId, index: 0 });
 
-    const duplicateDashboardTabIds = dashboardTabs
-      .slice(1)
-      .map((tab) => tab.id)
-      .filter((tabId) => typeof tabId === "number");
-    if (duplicateDashboardTabIds.length > 0) {
-      await chrome.tabs.remove(duplicateDashboardTabIds);
-    }
-
     return { reused: true, tabId: existingDashboardTab.id };
   }
 
@@ -2955,8 +2937,11 @@ async function openDashboardInAllNormalWindows() {
   };
 }
 
-async function getOpenTabsForWindow(state, windowId, workspaceId) {
-  const { tabs, changed } = await getWorkspaceTabsForWindow(state, windowId, workspaceId);
+async function getOpenTabsForWindow(state, windowId, workspaceId, options = {}) {
+  const { claimUnassigned = false } = options;
+  const { tabs, changed } = await getWorkspaceTabsForWindow(state, windowId, workspaceId, {
+    assignUnknownToWorkspaceId: claimUnassigned ? workspaceId : null
+  });
 
   return {
     changed,
@@ -3329,11 +3314,12 @@ async function getDashboardData(windowId) {
     const working = structuredClone(state);
     const ensured = ensureWorkspaceForWindow(working, windowId);
     const activeWorkspaceId = ensured.workspaceId;
-    const visibilityResult = await syncWindowWorkspaceVisibility(working, windowId, activeWorkspaceId);
-    let openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId);
+    let openTabsResult = await getOpenTabsForWindow(working, windowId, activeWorkspaceId, {
+      claimUnassigned: true
+    });
 
     let finalState = working;
-    if (ensured.changed || openTabsResult.changed || visibilityResult.changed) {
+    if (ensured.changed || openTabsResult.changed) {
       finalState = await saveState(working);
       await notifyStateUpdated();
     }
@@ -3582,6 +3568,7 @@ async function handleMessage(message) {
         if (!Number.isFinite(payload.tabId)) {
           throw new Error("Tab ID is required.");
         }
+        // Legacy action name: this sleeps by discarding in place and must not close the tab.
         const result = await sleepOpenTabsById(state, requestedWindowId, [payload.tabId], "manual");
         return { slept: result.sleptCount > 0, tabId: payload.tabId, ...result };
       });
