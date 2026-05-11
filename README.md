@@ -21,8 +21,8 @@ Chrome extension that organizes tabs by workspace in a full dashboard browser ta
   - Manual sleep button for open tabs.
   - Workspace switching hides prior-workspace tabs without deleting their records.
 - Memory management:
-  - Alarm-based cleanup discards inactive tabs in place (default: 120 minutes) to reduce memory without removing them from the tab strip.
-  - Uses tab `lastAccessed`, skips pinned and active tabs.
+  - Ordinator does not automatically close, hide, or discard tabs on a timer.
+  - Manual sleep actions discard selected tabs in place without removing them from the tab strip.
 - History snapshots:
   - Auto-captured on switch and manual sleep.
   - Per-workspace history with restore action.

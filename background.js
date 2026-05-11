@@ -35,9 +35,7 @@ const WORKSPACE_COLORS = Object.freeze([
 ]);
 
 const DEFAULT_SETTINGS = Object.freeze({
-  inactivityMinutes: 120,
   maxSnapshotsPerWorkspace: 20,
-  unfocusedSleepMinutes: 60,
   unsplashAccessKey: "SQ54dvC8cGsSs51mFhu-bb807LDd8FWOP_fm4IqhcMs"
 });
 
@@ -424,22 +422,19 @@ function normalizeState(state) {
     }
   }
 
+  const inputSettings = state.settings && typeof state.settings === "object" ? state.settings : {};
   const settings = {
-    ...DEFAULT_SETTINGS,
-    ...(state.settings && typeof state.settings === "object" ? state.settings : {})
+    ...DEFAULT_SETTINGS
   };
 
-  settings.inactivityMinutes = Math.max(5, Number(settings.inactivityMinutes) || DEFAULT_SETTINGS.inactivityMinutes);
   settings.maxSnapshotsPerWorkspace = Math.max(
     5,
-    Number(settings.maxSnapshotsPerWorkspace) || DEFAULT_SETTINGS.maxSnapshotsPerWorkspace
-  );
-  settings.unfocusedSleepMinutes = Math.max(
-    10,
-    Number(settings.unfocusedSleepMinutes) || DEFAULT_SETTINGS.unfocusedSleepMinutes
+    Number(inputSettings.maxSnapshotsPerWorkspace) || DEFAULT_SETTINGS.maxSnapshotsPerWorkspace
   );
   settings.unsplashAccessKey =
-    typeof settings.unsplashAccessKey === "string" ? settings.unsplashAccessKey.trim() : DEFAULT_SETTINGS.unsplashAccessKey;
+    typeof inputSettings.unsplashAccessKey === "string"
+      ? inputSettings.unsplashAccessKey.trim()
+      : DEFAULT_SETTINGS.unsplashAccessKey;
 
   const tabWorkspaceById = {};
   if (state.tabWorkspaceById && typeof state.tabWorkspaceById === "object") {
@@ -1047,10 +1042,9 @@ async function notifyStateUpdated() {
 }
 
 async function ensureAlarm() {
-  const existingAlarm = await chrome.alarms.get(MEMORY_ALARM);
-  if (!existingAlarm) {
-    await chrome.alarms.create(MEMORY_ALARM, { periodInMinutes: 5 });
-  }
+  // Retire the legacy automatic memory sweep. Tabs must not be discarded or
+  // hidden by a timer; only direct user actions may affect open tabs.
+  await chrome.alarms.clear(MEMORY_ALARM);
 }
 
 async function readStartupBootstrapState() {
@@ -1371,23 +1365,6 @@ function removeTabAssignments(state, tabIds) {
     }
   }
   removeTabIdsFromDeferredSleep(state, tabIds);
-}
-
-function scheduleDeferredSleep(state, windowId, workspaceId, tabIds) {
-  const uniqueTabIds = [...new Set((tabIds || []).filter((tabId) => Number.isFinite(tabId)))];
-  if (uniqueTabIds.length === 0) {
-    return;
-  }
-
-  const key = windowKey(windowId);
-  if (!state.deferredSleepByWindow[key]) {
-    state.deferredSleepByWindow[key] = {};
-  }
-
-  state.deferredSleepByWindow[key][workspaceId] = {
-    tabIds: uniqueTabIds,
-    dueAt: now() + state.settings.unfocusedSleepMinutes * 60 * 1000
-  };
 }
 
 function clearDeferredSleep(state, windowId, workspaceId) {
@@ -2462,7 +2439,11 @@ async function discardTabsInPlace(tabIds) {
   return discardedCount;
 }
 
-async function deleteTabsByUserRequest(tabIds) {
+async function deleteTabsByUserRequest(tabIds, options = {}) {
+  if (options.confirmedUserAction !== true) {
+    throw new Error("Refusing to close tabs without explicit user confirmation.");
+  }
+
   const uniqueTabIds = [...new Set((tabIds || []).filter((tabId) => typeof tabId === "number"))];
   if (uniqueTabIds.length === 0) {
     return 0;
@@ -2539,7 +2520,9 @@ async function deleteSelectedTabsPermanently(state, windowId, workspaceId, openT
       for (const touchedWorkspaceId of touchedWorkspaceIds) {
         state.workspaces[touchedWorkspaceId].updatedAt = now();
       }
-      deletedOpenCount = await deleteTabsByUserRequest(tabsToDelete.map((tab) => tab.id));
+      deletedOpenCount = await deleteTabsByUserRequest(tabsToDelete.map((tab) => tab.id), {
+        confirmedUserAction: true
+      });
     }
   }
 
@@ -3340,50 +3323,6 @@ async function mutateState(mutator) {
   });
 }
 
-async function runMemorySweep() {
-  return mutateState(async (state) => {
-    const cutoff = now() - state.settings.inactivityMinutes * 60 * 1000;
-    const tabs = await chrome.tabs.query({});
-    let discardedCount = 0;
-    let skippedUnassignedCount = 0;
-
-    for (const tab of tabs) {
-      const url = getTabUrl(tab);
-      if (
-        !Number.isFinite(tab?.id) ||
-        !Number.isFinite(tab?.windowId) ||
-        tab.pinned ||
-        tab.active ||
-        tab.discarded ||
-        !isWorkspaceManagedUrl(url) ||
-        !Number.isFinite(tab.lastAccessed) ||
-        tab.lastAccessed > cutoff
-      ) {
-        continue;
-      }
-
-      const tabIdKey = String(tab.id);
-      const workspaceId = state.tabWorkspaceById[tabIdKey];
-      if (!workspaceId || !state.workspaces[workspaceId] || Number.isFinite(state.workspaces[workspaceId].archivedAt)) {
-        skippedUnassignedCount += 1;
-        continue;
-      }
-      rememberTabRecord(state, tab);
-
-      try {
-        await chrome.tabs.discard(tab.id);
-        discardedCount += 1;
-      } catch (error) {
-        console.warn("Could not discard dormant tab:", tab.id, error);
-      }
-    }
-
-    const clearedDeferredSleep = Object.keys(state.deferredSleepByWindow || {}).length > 0;
-    state.deferredSleepByWindow = {};
-    return { discardedCount, assignedCount: 0, skippedUnassignedCount, sleptCount: 0, clearedDeferredSleep };
-  });
-}
-
 async function handleMessage(message) {
   const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
   const requestedWindowId = Number.isFinite(payload.windowId) ? payload.windowId : await fetchCurrentWindowId();
@@ -3563,18 +3502,20 @@ async function handleMessage(message) {
       });
     }
 
-    case "CLOSE_OPEN_TAB": {
+    case "SLEEP_OPEN_TAB": {
       return mutateState(async (state) => {
         if (!Number.isFinite(payload.tabId)) {
           throw new Error("Tab ID is required.");
         }
-        // Legacy action name: this sleeps by discarding in place and must not close the tab.
         const result = await sleepOpenTabsById(state, requestedWindowId, [payload.tabId], "manual");
         return { slept: result.sleptCount > 0, tabId: payload.tabId, ...result };
       });
     }
 
     case "DELETE_SELECTED_TABS": {
+      if (payload.confirmedDeletion !== true) {
+        throw new Error("Deleting tabs requires explicit user confirmation.");
+      }
       return mutateState(async (state) =>
         deleteSelectedTabsPermanently(
           state,
@@ -3727,21 +3668,12 @@ async function handleMessage(message) {
         const incomingSettings =
           payload.settings && typeof payload.settings === "object" ? payload.settings : {};
         const nextSettings = {
-          ...state.settings,
-          ...incomingSettings
+          ...state.settings
         };
 
-        nextSettings.inactivityMinutes = Math.max(
-          5,
-          Number(nextSettings.inactivityMinutes) || state.settings.inactivityMinutes
-        );
         nextSettings.maxSnapshotsPerWorkspace = Math.max(
           5,
-          Number(nextSettings.maxSnapshotsPerWorkspace) || state.settings.maxSnapshotsPerWorkspace
-        );
-        nextSettings.unfocusedSleepMinutes = Math.max(
-          10,
-          Number(nextSettings.unfocusedSleepMinutes) || state.settings.unfocusedSleepMinutes
+          Number(incomingSettings.maxSnapshotsPerWorkspace) || state.settings.maxSnapshotsPerWorkspace
         );
         nextSettings.unsplashAccessKey =
           typeof incomingSettings.unsplashAccessKey === "string"
@@ -3940,15 +3872,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   if (alarm.name === MEMORY_ALARM) {
-    void (async () => {
-      try {
-        await refreshExtensionHeartbeat("memory-alarm");
-        await runMemorySweep();
-        await refreshExtensionHeartbeat("memory-sweep");
-      } catch (error) {
-        console.warn("Could not complete memory sweep:", error);
-      }
-    })();
+    void chrome.alarms.clear(MEMORY_ALARM);
   }
 });
 

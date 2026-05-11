@@ -1070,13 +1070,13 @@ function renderTabsView(workspace) {
         actionsEl.appendChild(bookmarkButton);
       }
 
-      const closeButton = createIconActionButton({
+      const sleepTabButton = createIconActionButton({
         icon: "☾",
         title: "Sleep tab",
         onClick: () => {
           void runAction(
             () =>
-              send("CLOSE_OPEN_TAB", {
+              send("SLEEP_OPEN_TAB", {
                 windowId: state.windowId,
                 tabId: tab.id
               }),
@@ -1084,7 +1084,7 @@ function renderTabsView(workspace) {
           );
         }
       });
-      actionsEl.appendChild(closeButton);
+      actionsEl.appendChild(sleepTabButton);
 
       const moveMenu = createMoveMenuControl(workspace.id, (targetWorkspaceId) => {
         void runAction(
@@ -1351,7 +1351,7 @@ function renderHistoryView(workspace) {
   root.className = "section";
   root.innerHTML = `
     <h3>Snapshot History</h3>
-    <p class="section-note">Automatic snapshots captured during switch/sleep/memory cleanup.</p>
+    <p class="section-note">Automatic snapshots captured during workspace switches and manual sleep actions.</p>
   `;
 
   if (!workspace.history.length) {
@@ -1567,20 +1567,12 @@ function renderSettingsView() {
   memorySection.className = "section";
   memorySection.innerHTML = `
     <h3>Memory Settings</h3>
-    <p class="section-note">Dormant and manually slept tabs are discarded in place to reduce memory without closing tabs or losing their tab-strip position.</p>
+    <p class="section-note">Ordinator does not automatically sleep, discard, hide, or close tabs on a timer. Manual sleep actions discard tabs in place without removing them from the tab strip.</p>
   `;
 
   const form = document.createElement("form");
   form.className = "settings-form";
   form.innerHTML = `
-    <label class="settings-row">
-      <span>Sleep tabs after inactivity (minutes)</span>
-      <input name="inactivityMinutes" type="number" min="5" step="5" value="${state.dashboard.settings.inactivityMinutes}" required />
-    </label>
-    <label class="settings-row">
-      <span>Sleep unfocused workspace after (minutes)</span>
-      <input name="unfocusedSleepMinutes" type="number" min="10" step="5" value="${state.dashboard.settings.unfocusedSleepMinutes}" required />
-    </label>
     <label class="settings-row">
       <span>Snapshots retained per workspace</span>
       <input name="maxSnapshotsPerWorkspace" type="number" min="5" step="1" value="${state.dashboard.settings.maxSnapshotsPerWorkspace}" required />
@@ -1595,8 +1587,6 @@ function renderSettingsView() {
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const formData = new FormData(form);
-    const inactivityMinutes = Number(formData.get("inactivityMinutes"));
-    const unfocusedSleepMinutes = Number(formData.get("unfocusedSleepMinutes"));
     const maxSnapshotsPerWorkspace = Number(formData.get("maxSnapshotsPerWorkspace"));
     const unsplashAccessKey = String(formData.get("unsplashAccessKey") || "").trim();
 
@@ -1605,8 +1595,6 @@ function renderSettingsView() {
         send("UPDATE_SETTINGS", {
           windowId: state.windowId,
           settings: {
-            inactivityMinutes,
-            unfocusedSleepMinutes,
             maxSnapshotsPerWorkspace,
             unsplashAccessKey
           }
@@ -1884,7 +1872,8 @@ async function deleteSelectedTabs() {
       windowId: state.windowId,
       workspaceId: workspace.id,
       openTabIds,
-      sleepingTabs
+      sleepingTabs,
+      confirmedDeletion: true
     });
     resetTabSelection(workspace.id);
     await refreshDashboard(true);
