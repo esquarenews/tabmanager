@@ -2420,10 +2420,32 @@ async function openTabRecords(windowId, records, options = {}) {
   return { openedCount, tabIds, tabs: openedTabs };
 }
 
-async function discardTabsInPlace(tabIds) {
+async function focusNeutralTabBeforeDiscard(windowId, tabIds) {
+  const targetTabIds = new Set((tabIds || []).filter((tabId) => typeof tabId === "number"));
+  if (targetTabIds.size === 0 || !Number.isFinite(windowId)) {
+    return false;
+  }
+
+  const windowTabs = await chrome.tabs.query({ windowId });
+  const activeTargetTab = windowTabs.find((tab) => tab.active && Number.isFinite(tab.id) && targetTabIds.has(tab.id));
+  if (!activeTargetTab) {
+    return false;
+  }
+
+  await openOrFocusDashboard(windowId);
+  return true;
+}
+
+async function discardTabsInPlace(windowId, tabIds) {
   const uniqueTabIds = [...new Set((tabIds || []).filter((tabId) => typeof tabId === "number"))];
   if (uniqueTabIds.length === 0) {
     return 0;
+  }
+
+  try {
+    await focusNeutralTabBeforeDiscard(windowId, uniqueTabIds);
+  } catch (error) {
+    console.warn("Could not focus neutral tab before discarding active tab:", error);
   }
 
   let discardedCount = 0;
@@ -2580,7 +2602,7 @@ async function sleepOpenTabsById(state, windowId, tabIds, reason) {
   }
 
   await saveState(state);
-  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
+  const discardedCount = await discardTabsInPlace(windowId, tabs.map((tab) => tab.id));
 
   return {
     sleptCount: discardedCount,
@@ -2603,7 +2625,7 @@ async function sleepActiveWorkspaceTabs(state, windowId, reason) {
   clearDeferredSleep(state, windowId, workspace.id);
 
   await saveState(state);
-  const discardedCount = await discardTabsInPlace(tabs.map((tab) => tab.id));
+  const discardedCount = await discardTabsInPlace(windowId, tabs.map((tab) => tab.id));
 
   return { workspaceId: ensured.workspaceId, sleptCount: discardedCount };
 }
